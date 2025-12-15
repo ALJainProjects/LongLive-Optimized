@@ -1,40 +1,102 @@
-opencv-python>=4.9.0.80
-diffusers==0.31.0
+# LongLive-Optimized Requirements
+# ================================
+# Core dependencies for inference-time latency optimizations
+
+# =============================================================================
+# PyTorch and CUDA (install separately based on your CUDA version)
+# =============================================================================
+# torch>=2.0.0
+# Install via: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# =============================================================================
+# Core Deep Learning
+# =============================================================================
 transformers>=4.49.0
 tokenizers>=0.20.3
 accelerate>=1.1.1
-tqdm
-datasets
-imageio
-easydict
-ftfy
-dashscope
-imageio-ffmpeg
-# numpy==1.24.4
-wandb
-omegaconf
-einops
-av==13.1.0
-opencv-python
-git+https://github.com/openai/CLIP.git
-open_clip_torch
-starlette
-pycocotools
-lmdb
-matplotlib
-sentencepiece
-pydantic==2.10.6
-scikit-image
-huggingface_hub[cli]
-dominate
-nvidia-pyindex
-nvidia-tensorrt
-pycuda
-onnx
-onnxruntime
-onnxscript
-onnxconverter_common
-flask
-flask-socketio
-torchao
-peft
+diffusers==0.31.0
+einops>=0.7.0
+safetensors>=0.4.0
+
+# =============================================================================
+# Attention Optimizations (Required for LongLive)
+# =============================================================================
+flash-attn>=2.5.0  # Requires CUDA, install separately if needed
+# Install via: pip install flash-attn --no-build-isolation
+
+# =============================================================================
+# Model Weights and Hub
+# =============================================================================
+huggingface_hub[cli]>=0.20.0
+
+# =============================================================================
+# Configuration and CLI
+# =============================================================================
+omegaconf>=2.3.0
+easydict>=1.10
+pydantic>=2.0.0
+
+# =============================================================================
+# Image/Video Processing
+# =============================================================================
+opencv-python>=4.9.0
+imageio>=2.33.0
+imageio-ffmpeg>=0.4.9
+av>=13.0.0
+Pillow>=10.0.0
+
+# =============================================================================
+# Quality Evaluation Metrics
+# =============================================================================
+scikit-image>=0.22.0       # For SSIM, PSNR
+lpips>=0.1.4               # Perceptual similarity
+open_clip_torch>=2.24.0    # CLIP scores
+git+https://github.com/openai/CLIP.git  # OpenAI CLIP
+
+# =============================================================================
+# Numerical Computing
+# =============================================================================
+numpy>=1.24.0,<2.0.0
+scipy>=1.11.0
+
+# =============================================================================
+# Visualization and Logging
+# =============================================================================
+matplotlib>=3.8.0
+tqdm>=4.66.0
+wandb>=0.16.0             # Optional: experiment tracking
+
+# =============================================================================
+# Benchmarking and Profiling
+# =============================================================================
+# torch.cuda provides CUDA events (no extra deps)
+# nvitop for GPU monitoring (optional)
+
+# =============================================================================
+# Web Demo (Scope Integration) - Optional
+# =============================================================================
+starlette>=0.35.0
+fastapi>=0.109.0
+uvicorn>=0.27.0
+aiortc>=1.6.0              # WebRTC support
+aiohttp>=3.9.0
+
+# =============================================================================
+# Development and Testing
+# =============================================================================
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+black>=24.0.0
+ruff>=0.1.0
+
+# =============================================================================
+# Optional: Quantization Support
+# =============================================================================
+# torchao>=0.1.0           # PyTorch native quantization
+# bitsandbytes>=0.42.0     # 8-bit optimizers and quantization
+
+# =============================================================================
+# Optional: TensorRT Acceleration (for further optimization)
+# =============================================================================
+# nvidia-tensorrt          # Requires NVIDIA GPU and registration
+# tensorrt>=8.6.0

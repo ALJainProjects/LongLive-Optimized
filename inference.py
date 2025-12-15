@@ -1,5 +1,9 @@
 # Adopted from https://github.com/guandeh17/Self-Forcing
 # SPDX-License-Identifier: Apache-2.0
+#
+# LongLive-Optimized: This file has been modified to support latency optimizations.
+# Use --optimized flag to enable torch.compile, prompt caching, async VAE, etc.
+#
 import argparse
 import torch
 import os
@@ -20,8 +24,35 @@ from utils.misc import set_seed
 
 from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log_gpu_memory
 
-parser = argparse.ArgumentParser()
+# === Argument Parser ===
+parser = argparse.ArgumentParser(description="LongLive Video Generation with Latency Optimizations")
 parser.add_argument("--config_path", type=str, help="Path to the config file")
+
+# Optimization arguments
+parser.add_argument(
+    "--optimized",
+    action="store_true",
+    help="Enable latency optimizations (prompt cache, async VAE, etc.)"
+)
+parser.add_argument(
+    "--opt-preset",
+    type=str,
+    default="balanced",
+    choices=["quality", "balanced", "speed"],
+    help="Optimization preset: quality (minimal opts), balanced (recommended), speed (max opts)"
+)
+parser.add_argument(
+    "--opt-config",
+    type=str,
+    default=None,
+    help="Path to optimization config YAML (overrides --opt-preset)"
+)
+parser.add_argument(
+    "--profile",
+    action="store_true",
+    help="Enable detailed latency profiling"
+)
+
 args = parser.parse_args()
 
 config = OmegaConf.load(args.config_path)
@@ -138,6 +169,45 @@ if low_memory:
 pipeline.generator.to(device=device)
 pipeline.vae.to(device=device)
 
+# === Apply Latency Optimizations ===
+if args.optimized:
+    from optimizations import OptimizedCausalInferencePipeline, OptimizationConfig
+
+    # Load optimization config
+    if args.opt_config:
+        opt_config = OptimizationConfig.from_yaml(args.opt_config)
+    else:
+        presets = {
+            "quality": OptimizationConfig.preset_quality,
+            "balanced": OptimizationConfig.preset_balanced,
+            "speed": OptimizationConfig.preset_speed,
+        }
+        opt_config = presets[args.opt_preset]()
+
+    # Enable profiling if requested
+    opt_config.enable_profiling = args.profile
+
+    # Wrap pipeline with optimizations
+    if local_rank == 0:
+        print(f"\n{'='*60}")
+        print(f"OPTIMIZED INFERENCE ENABLED")
+        print(f"{'='*60}")
+        print(f"Preset: {args.opt_preset}")
+        print(f"torch.compile: {opt_config.use_torch_compile} (mode={opt_config.compile_mode})")
+        print(f"Prompt cache: {opt_config.use_prompt_cache}")
+        print(f"Async VAE: {opt_config.use_async_vae}")
+        print(f"Memory pool: {opt_config.use_memory_pool}")
+        print(f"Static KV: {opt_config.use_static_kv}")
+        print(f"Quantized KV: {opt_config.use_quantized_kv}")
+        print(f"Profiling: {opt_config.enable_profiling}")
+        print(f"{'='*60}\n")
+
+    pipeline = OptimizedCausalInferencePipeline.from_base(pipeline, opt_config, device)
+else:
+    if local_rank == 0:
+        print("\nRunning ORIGINAL pipeline (no optimizations)")
+        print("Use --optimized flag to enable latency optimizations\n")
+
 extended_prompt_path = config.data_path
 dataset = TextDataset(prompt_path=config.data_path, extended_prompt_path=extended_prompt_path)
 num_prompts = len(dataset)
@@ -209,7 +279,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         text_prompts=prompts,
         return_latents=True,
         low_memory=low_memory,
-        profile=False,
+        profile=args.profile,
     )
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     all_video.append(current_video)
