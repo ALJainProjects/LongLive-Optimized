@@ -3,11 +3,13 @@
 # Lambda Labs H100 Setup Script for LongLive-Optimized
 #
 # This script sets up the environment on a Lambda Labs H100 instance:
-# 1. Installs system dependencies
-# 2. Sets up Python environment with PyTorch 2.x
-# 3. Installs flash-attention and other requirements
-# 4. Downloads model weights
-# 5. Verifies GPU setup
+# 1. Uses Lambda Stack's pre-installed PyTorch/CUDA (via --system-site-packages)
+# 2. Installs additional requirements
+# 3. Downloads model weights
+# 4. Verifies GPU setup
+#
+# Based on Lambda Labs documentation:
+# https://docs.lambdalabs.com/on-demand-cloud/managing-your-system-environment
 #
 # Usage:
 #   chmod +x scripts/setup_h100.sh
@@ -21,106 +23,128 @@ echo "LongLive-Optimized Setup Script"
 echo "Lambda Labs H100"
 echo "========================================"
 
-# Check if running on Lambda Labs
-if ! nvidia-smi | grep -q "H100"; then
-    echo "Warning: This script is optimized for H100 GPUs"
-fi
+# Prevent system from sleeping/suspending during long jobs
+echo ""
+echo "Preventing system sleep/suspend..."
+sudo systemctl mask hibernate.target hybrid-sleep.target \
+    suspend-then-hibernate.target sleep.target suspend.target
 
-# Show GPU info
+# Check if running on Lambda Labs with H100
 echo ""
 echo "GPU Information:"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
 
-# Update system
+if ! nvidia-smi | grep -q "H100"; then
+    echo "Warning: This script is optimized for H100 GPUs"
+fi
+
+# Show Lambda Stack info
 echo ""
-echo "Installing system dependencies..."
-sudo apt-get update
-sudo apt-get install -y \
-    git \
-    cmake \
-    ninja-build \
-    libopenblas-dev \
-    ffmpeg \
-    libsm6 \
-    libxext6
+echo "Lambda Stack Python/PyTorch:"
+python3 --version
+python3 -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.version.cuda}')" 2>/dev/null || echo "PyTorch not found in system Python"
 
 # Check CUDA version
 echo ""
 echo "CUDA Information:"
-nvcc --version
+nvcc --version 2>/dev/null || echo "nvcc not in PATH"
 
-# Create virtual environment
+# Install minimal system dependencies (most are already on Lambda Stack)
 echo ""
-echo "Creating Python virtual environment..."
-python3 -m venv ~/.venv/longlive
-source ~/.venv/longlive/bin/activate
+echo "Installing system dependencies..."
+sudo apt-get update
+sudo apt-get install -y \
+    ffmpeg \
+    libsm6 \
+    libxext6
+
+# Create virtual environment with --system-site-packages
+# This inherits Lambda Stack's PyTorch, CUDA, and other preinstalled packages
+echo ""
+echo "Creating Python virtual environment (inheriting Lambda Stack packages)..."
+VENV_DIR="${HOME}/.venv/longlive-optimized"
+
+if [ -d "$VENV_DIR" ]; then
+    echo "Virtual environment already exists at $VENV_DIR"
+    echo "Activating existing environment..."
+else
+    python3 -m venv --system-site-packages "$VENV_DIR"
+    echo "Created new virtual environment at $VENV_DIR"
+fi
+
+source "$VENV_DIR/bin/activate"
 
 # Upgrade pip
 pip install --upgrade pip wheel setuptools
 
-# Install PyTorch with CUDA 12.x
+# Verify PyTorch CUDA (inherited from Lambda Stack)
 echo ""
-echo "Installing PyTorch..."
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+echo "Verifying Lambda Stack PyTorch..."
+python3 -c "
+import torch
+print(f'PyTorch: {torch.__version__}')
+print(f'CUDA available: {torch.cuda.is_available()}')
+print(f'CUDA version: {torch.version.cuda}')
+if torch.cuda.is_available():
+    print(f'GPU: {torch.cuda.get_device_name(0)}')
+    print(f'VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
+"
 
-# Verify PyTorch CUDA
-python3 -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA version: {torch.version.cuda}')"
-
-# Install flash-attention
+# Install flash-attention (if not already installed)
 echo ""
-echo "Installing flash-attention (this may take a few minutes)..."
-pip install flash-attn --no-build-isolation
+echo "Checking flash-attention..."
+if python3 -c "import flash_attn" 2>/dev/null; then
+    echo "flash-attention already installed"
+else
+    echo "Installing flash-attention (this may take a few minutes)..."
+    pip install flash-attn --no-build-isolation
+fi
 
-# Install LongLive requirements
+# Install LongLive requirements (only what's not in Lambda Stack)
 echo ""
-echo "Installing LongLive requirements..."
+echo "Installing additional requirements..."
 pip install \
-    accelerate \
-    diffusers \
-    transformers \
     omegaconf \
     einops \
     timm \
     lpips \
-    clip \
-    opencv-python \
+    ftfy \
+    regex \
     imageio \
     imageio-ffmpeg \
-    wandb \
-    tensorboard \
     pyyaml \
-    tqdm \
-    ftfy \
-    regex
+    peft
 
-# Install additional optimization requirements
-pip install \
-    numpy \
-    scipy \
-    pillow \
-    matplotlib
+# Install huggingface_hub for model downloads
+pip install huggingface_hub
 
-# Clone LongLive if not in repo directory
-if [ ! -f "inference.py" ]; then
+# Clone LongLive-Optimized if not in repo directory
+REPO_DIR="${HOME}/LongLive-Optimized"
+if [ ! -f "inference.py" ] && [ ! -f "$REPO_DIR/inference.py" ]; then
     echo ""
-    echo "Cloning LongLive repository..."
-    cd ..
-    git clone https://github.com/NVlabs/LongLive.git
-    cd LongLive
+    echo "Cloning LongLive-Optimized repository..."
+    git clone https://github.com/ALJainProjects/LongLive-Optimized.git "$REPO_DIR"
+    cd "$REPO_DIR"
+elif [ -f "$REPO_DIR/inference.py" ]; then
+    cd "$REPO_DIR"
+    echo "Repository already exists at $REPO_DIR"
+else
+    echo "Already in repository directory"
 fi
 
 # Download model weights
 echo ""
 echo "Downloading model weights..."
-echo "Note: You may need to manually download from HuggingFace if authentication is required"
+echo "Note: You may need to authenticate with HuggingFace for some models"
 
 # Create weights directory
 mkdir -p checkpoints
 
 # Download Wan2.1-T2V-1.3B (base model)
-echo "Downloading Wan2.1-T2V-1.3B..."
+echo ""
+echo "Checking Wan2.1-T2V-1.3B..."
 if [ ! -d "checkpoints/Wan2.1-T2V-1.3B" ]; then
-    pip install huggingface_hub
+    echo "Downloading Wan2.1-T2V-1.3B..."
     python3 -c "
 from huggingface_hub import snapshot_download
 snapshot_download(
@@ -130,20 +154,26 @@ snapshot_download(
 )
 print('Wan2.1-T2V-1.3B downloaded successfully')
 "
+else
+    echo "Wan2.1-T2V-1.3B already exists"
 fi
 
 # Download LongLive checkpoint
-echo "Downloading LongLive checkpoint..."
+echo ""
+echo "Checking LongLive-1.3B..."
 if [ ! -d "checkpoints/LongLive-1.3B" ]; then
+    echo "Downloading LongLive-1.3B..."
     python3 -c "
 from huggingface_hub import snapshot_download
 snapshot_download(
-    repo_id='nvlabs/LongLive-1.3B',
+    repo_id='NVlabs/LongLive-1.3B',
     local_dir='checkpoints/LongLive-1.3B',
     local_dir_use_symlinks=False,
 )
 print('LongLive-1.3B downloaded successfully')
 "
+else
+    echo "LongLive-1.3B already exists"
 fi
 
 # Verify installation
@@ -168,14 +198,17 @@ echo "Running quick sanity check..."
 python3 -c "
 import torch
 import sys
-sys.path.append('.')
+sys.path.insert(0, '.')
 from optimizations import OptimizationConfig, LatencyProfiler
 
 config = OptimizationConfig.preset_balanced()
 profiler = LatencyProfiler()
 
 print('Optimizations module loaded successfully!')
-print(f'Config: {config}')
+print(f'  torch.compile: {config.use_torch_compile}')
+print(f'  Compile mode: {config.compile_mode}')
+print(f'  Static KV: {config.use_static_kv}')
+print(f'  Async VAE: {config.use_async_vae}')
 "
 
 echo ""
@@ -183,12 +216,14 @@ echo "========================================"
 echo "Setup Complete!"
 echo "========================================"
 echo ""
+echo "Virtual environment: $VENV_DIR"
+echo ""
 echo "To activate the environment:"
-echo "  source ~/.venv/longlive/bin/activate"
+echo "  source $VENV_DIR/bin/activate"
+echo ""
+echo "To run optimized inference:"
+echo "  python inference.py --config configs/longlive_inference.yaml --optimized"
 echo ""
 echo "To run benchmarks:"
-echo "  python benchmarks/benchmark_suite.py --config configs/longlive_inference.yaml"
-echo ""
-echo "To compare baseline vs optimized:"
 echo "  python benchmarks/benchmark_suite.py --config configs/longlive_inference.yaml --compare"
 echo ""
