@@ -37,6 +37,10 @@ from .memory_pool import FixedShapeMemoryPool, LongLiveMemoryPool, BufferSpec
 from .sync_elimination import SyncFreeContext, SyncPointTracker, AsyncValue, AsyncCPUTransfer
 from .quantized_kv import QuantizedKVCache, QuantizationConfig
 from .optimized_pipeline import OptimizedCausalInferencePipeline, create_optimized_pipeline
+from .optimized_interactive_pipeline import (
+    OptimizedInteractiveCausalInferencePipeline,
+    create_optimized_interactive_pipeline,
+)
 from .longlive_integration import (
     add_optimization_args,
     maybe_optimize_pipeline,
@@ -49,7 +53,9 @@ __all__ = [
     # Main classes
     'OptimizationConfig',
     'OptimizedCausalInferencePipeline',
+    'OptimizedInteractiveCausalInferencePipeline',
     'create_optimized_pipeline',
+    'create_optimized_interactive_pipeline',
 
     # Profiling
     'LatencyProfiler',

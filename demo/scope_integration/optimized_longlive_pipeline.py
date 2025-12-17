@@ -160,16 +160,82 @@ class OptimizedScopePipeline:
         """
         Load the base LongLive pipeline.
 
-        This should be replaced with actual scope pipeline loading.
+        Loads the actual LongLive model components for real inference.
         """
-        # Placeholder - in real integration, this loads scope's LongLivePipeline
-        self.base_pipeline = None
-        self.generator = None
-        self.text_encoder = None
-        self.vae = None
+        from pathlib import Path
+        from omegaconf import OmegaConf
 
         print(f"Loading LongLive model from: {self.model_path}")
-        print("Note: Replace _load_base_pipeline with actual scope loading code")
+
+        # Check if model_path is a config file or directory
+        model_path = Path(self.model_path)
+
+        if model_path.suffix in ['.yaml', '.yml']:
+            # Load from config file
+            config = OmegaConf.load(model_path)
+        elif model_path.is_dir():
+            # Look for config in directory
+            config_candidates = list(model_path.glob("*.yaml")) + list(model_path.glob("*.yml"))
+            if config_candidates:
+                config = OmegaConf.load(config_candidates[0])
+            else:
+                # Create minimal config for direct model loading
+                config = OmegaConf.create({
+                    "model_name": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+                    "denoising_step_list": [1000, 750, 500, 250],
+                    "context_noise": 0,
+                    "num_frame_per_block": 1,
+                })
+        else:
+            raise ValueError(f"model_path must be a config file or directory: {self.model_path}")
+
+        # Import pipeline components
+        try:
+            from pipeline.causal_inference import CausalInferencePipeline
+
+            # Create base pipeline
+            self.base_pipeline = CausalInferencePipeline(config, device=self.device)
+
+            # Load checkpoint if specified
+            if hasattr(config, 'generator_ckpt') and config.generator_ckpt:
+                state_dict = torch.load(config.generator_ckpt, map_location="cpu")
+                if "generator" in state_dict or "generator_ema" in state_dict:
+                    gen_key = "generator_ema" if getattr(config, 'use_ema', False) else "generator"
+                    self.base_pipeline.generator.load_state_dict(state_dict[gen_key])
+                print(f"Loaded generator checkpoint: {config.generator_ckpt}")
+
+            # Move to device and dtype
+            self.base_pipeline = self.base_pipeline.to(dtype=self.dtype)
+            self.base_pipeline.generator.to(device=self.device)
+            self.base_pipeline.vae.to(device=self.device)
+
+            # Store references to components
+            self.generator = self.base_pipeline.generator
+            self.text_encoder = self.base_pipeline.text_encoder
+            self.vae = self.base_pipeline.vae
+
+            # Store config for later use
+            self._config = config
+            self._frame_seq_length = getattr(self.base_pipeline, 'frame_seq_length', 1560)
+            self._num_transformer_blocks = getattr(self.base_pipeline, 'num_transformer_blocks', 30)
+            self._denoising_steps = getattr(config, 'denoising_step_list', [1000, 750, 500, 250])
+
+            print(f"LongLive pipeline loaded successfully")
+            print(f"  Generator: {type(self.generator).__name__}")
+            print(f"  Text Encoder: {type(self.text_encoder).__name__}")
+            print(f"  VAE: {type(self.vae).__name__}")
+
+        except ImportError as e:
+            print(f"Warning: Could not import LongLive pipeline: {e}")
+            print("Running in demo mode with placeholder models")
+            self.base_pipeline = None
+            self.generator = None
+            self.text_encoder = None
+            self.vae = None
+            self._config = config if 'config' in dir() else None
+            self._frame_seq_length = 1560
+            self._num_transformer_blocks = 30
+            self._denoising_steps = [1000, 750, 500, 250]
 
     def _setup_optimizations(self):
         """Initialize all optimization components."""
@@ -321,6 +387,10 @@ class OptimizedScopePipeline:
         if prompt != self.current_prompt:
             self._handle_prompt_change(prompt)
 
+        # Initialize internal KV caches if using actual generator and not already initialized
+        if self.generator is not None and not hasattr(self, '_kv_cache_internal'):
+            self._initialize_internal_kv_caches()
+
         # Generate frame using sync-free context
         with SyncFreeContext(warn_only=True):
             # Get noise
@@ -383,36 +453,96 @@ class OptimizedScopePipeline:
 
         self.current_prompt = new_prompt
 
-    def _encode_prompt(self, prompt: str) -> torch.Tensor:
-        """Encode prompt to embeddings."""
-        # Placeholder - replace with actual text encoder
+    def _encode_prompt(self, prompt: str) -> dict:
+        """Encode prompt to embeddings using actual text encoder."""
         if self.text_encoder is not None:
-            return self.text_encoder.encode([prompt])
-        return torch.randn(1, 77, 4096, device=self.device, dtype=self.dtype)
+            # Use the text encoder's forward method which returns a dict
+            return self.text_encoder(text_prompts=[prompt])
+        # Fallback for demo mode - return dict format expected by generator
+        return {
+            "prompt_embeds": torch.randn(1, 512, 4096, device=self.device, dtype=self.dtype)
+        }
 
     def _denoise_step(
         self,
         latents: torch.Tensor,
         timestep: int,
     ) -> torch.Tensor:
-        """Single denoising step."""
-        # Placeholder - replace with actual denoising
+        """Single denoising step using actual generator."""
         if self.generator is not None:
-            return self.generator(
-                latents,
-                timestep=timestep,
-                prompt_embeds=self.prompt_embeddings,
-                kv_cache=self.kv_cache,
+            batch_size = latents.shape[0]
+            num_frames = latents.shape[2] if latents.dim() == 5 else 1
+
+            # Reshape latents if needed: [B, C, T, H, W] -> [B, T, C, H, W]
+            if latents.dim() == 5 and latents.shape[1] == 16:  # [B, C, T, H, W]
+                latents = latents.permute(0, 2, 1, 3, 4)  # -> [B, T, C, H, W]
+
+            # Create timestep tensor
+            timestep_tensor = torch.ones(
+                [batch_size, num_frames],
+                device=self.device,
+                dtype=torch.int64
+            ) * timestep
+
+            # Run generator forward pass
+            _, denoised = self.generator(
+                noisy_image_or_video=latents,
+                conditional_dict=self.prompt_embeddings,
+                timestep=timestep_tensor,
+                kv_cache=getattr(self, '_kv_cache_internal', None),
+                crossattn_cache=getattr(self, '_crossattn_cache_internal', None),
+                current_start=self.frame_idx * self._frame_seq_length,
             )
+            return denoised
+        # Fallback for demo mode
         return latents
 
     def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """Decode latents to pixel space."""
-        # Placeholder - replace with actual VAE decode
+        """Decode latents to pixel space using actual VAE."""
         if self.vae is not None:
-            return self.vae.decode(latents)
-        # Return dummy frame
+            # Use VAE's decode_to_pixel method for proper decoding
+            # latents shape: [B, T, C, H, W] or [B, C, H, W]
+            video = self.vae.decode_to_pixel(latents, use_cache=False)
+            # Normalize to [0, 1]
+            video = (video * 0.5 + 0.5).clamp(0, 1)
+            # Return single frame: [C, H, W]
+            if video.dim() == 5:  # [B, T, C, H, W]
+                return video[0, 0]  # First batch, first frame
+            elif video.dim() == 4:  # [B, C, H, W]
+                return video[0]  # First batch
+            return video
+        # Fallback for demo mode - return dummy frame
         return torch.randn(3, 480, 832, device=self.device, dtype=self.dtype)
+
+    def _initialize_internal_kv_caches(self):
+        """Initialize internal KV caches for actual generator inference."""
+        if self.generator is None:
+            return
+
+        # Calculate KV cache size based on local attention config
+        local_attn_size = self.config.local_attn_size
+        kv_cache_size = local_attn_size * self._frame_seq_length
+
+        # Initialize self-attention KV cache (30 transformer blocks)
+        self._kv_cache_internal = []
+        for _ in range(self._num_transformer_blocks):
+            self._kv_cache_internal.append({
+                "k": torch.zeros([1, kv_cache_size, 12, 128], dtype=self.dtype, device=self.device),
+                "v": torch.zeros([1, kv_cache_size, 12, 128], dtype=self.dtype, device=self.device),
+                "global_end_index": torch.tensor([0], dtype=torch.long, device=self.device),
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=self.device),
+            })
+
+        # Initialize cross-attention cache
+        self._crossattn_cache_internal = []
+        for _ in range(self._num_transformer_blocks):
+            self._crossattn_cache_internal.append({
+                "k": torch.zeros([1, 512, 12, 128], dtype=self.dtype, device=self.device),
+                "v": torch.zeros([1, 512, 12, 128], dtype=self.dtype, device=self.device),
+                "is_init": False,
+            })
+
+        print(f"Initialized internal KV caches (kv_cache_size={kv_cache_size})")
 
     def _record_latency(self, latency_ms: float):
         """Record latency for tracking."""
@@ -459,6 +589,20 @@ class OptimizedScopePipeline:
 
         if self.kv_cache:
             self.kv_cache.reset()
+
+        # Reset internal KV caches if they exist
+        if hasattr(self, '_kv_cache_internal') and self._kv_cache_internal:
+            for cache in self._kv_cache_internal:
+                cache["k"].zero_()
+                cache["v"].zero_()
+                cache["global_end_index"].zero_()
+                cache["local_end_index"].zero_()
+
+        if hasattr(self, '_crossattn_cache_internal') and self._crossattn_cache_internal:
+            for cache in self._crossattn_cache_internal:
+                cache["k"].zero_()
+                cache["v"].zero_()
+                cache["is_init"] = False
 
     def set_optimization_preset(self, preset: str):
         """

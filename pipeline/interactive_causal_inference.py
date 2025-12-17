@@ -103,6 +103,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         switch_frame_indices: List[int],
         return_latents: bool = False,
         low_memory: bool = False,
+        profile: bool = False,  # For compatibility with optimized pipeline
     ):
         """Generate a video and switch prompts at specified frame indices.
 
