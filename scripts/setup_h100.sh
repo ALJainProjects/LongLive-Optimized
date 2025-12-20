@@ -74,8 +74,10 @@ fi
 
 source "$VENV_DIR/bin/activate"
 
-# Upgrade pip
-pip install --upgrade pip wheel setuptools
+# Upgrade pip and install compatible setuptools/packaging versions
+# Note: flash-attn build requires specific versions to avoid canonicalize_version error
+pip install --upgrade pip wheel
+pip install 'setuptools==70.0.0' 'packaging==23.2' ninja
 
 # Verify PyTorch CUDA (inherited from Lambda Stack)
 echo ""

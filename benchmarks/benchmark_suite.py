@@ -113,16 +113,16 @@ def measure_steady_state(pipeline, num_frames: int, warmup: int, prompt: str) ->
 
     device = next(pipeline.parameters()).device if hasattr(pipeline, 'parameters') else torch.device('cuda')
 
-    # Create sample input - adjust shape based on your model
-    # LongLive latent shape: [batch, channels, frames, H, W]
+    # Create sample input - LongLive latent shape: [batch, num_frames, channels, H, W]
+    # Using 3 frames per block as per config (num_frame_per_block: 3)
     def get_noise():
-        return torch.randn(1, 16, 3, 60, 104, device=device, dtype=torch.bfloat16)
+        return torch.randn(1, 3, 16, 60, 104, device=device, dtype=torch.bfloat16)
 
     # Warmup
     for _ in range(warmup):
         noise = get_noise()
         with torch.no_grad():
-            _ = pipeline.inference(noise, [prompt], num_frames=1)
+            _ = pipeline.inference(noise, [prompt])
 
     torch.cuda.reset_peak_memory_stats()
 
@@ -133,7 +133,7 @@ def measure_steady_state(pipeline, num_frames: int, warmup: int, prompt: str) ->
     for i in range(num_frames):
         noise = get_noise()
         with torch.no_grad():
-            _ = pipeline.inference(noise, [prompt], num_frames=1)
+            _ = pipeline.inference(noise, [prompt])
         end_events[i].record()
 
     torch.cuda.synchronize()
@@ -168,7 +168,7 @@ def measure_prompt_switch(pipeline, num_switches: int, frames_between: int) -> D
     device = next(pipeline.parameters()).device if hasattr(pipeline, 'parameters') else torch.device('cuda')
 
     def get_noise():
-        return torch.randn(1, 16, 3, 60, 104, device=device, dtype=torch.bfloat16)
+        return torch.randn(1, 3, 16, 60, 104, device=device, dtype=torch.bfloat16)
 
     prompt_idx = 0
     latencies = []
@@ -178,7 +178,7 @@ def measure_prompt_switch(pipeline, num_switches: int, frames_between: int) -> D
         for _ in range(frames_between):
             noise = get_noise()
             with torch.no_grad():
-                _ = pipeline.inference(noise, [TEST_PROMPTS[prompt_idx]], num_frames=1)
+                _ = pipeline.inference(noise, [TEST_PROMPTS[prompt_idx]])
 
         # Switch prompt
         prompt_idx = (prompt_idx + 1) % len(TEST_PROMPTS)
@@ -195,7 +195,7 @@ def measure_prompt_switch(pipeline, num_switches: int, frames_between: int) -> D
         # First frame with new prompt
         noise = get_noise()
         with torch.no_grad():
-            _ = pipeline.inference(noise, [TEST_PROMPTS[prompt_idx]], num_frames=1)
+            _ = pipeline.inference(noise, [TEST_PROMPTS[prompt_idx]])
 
         end.record()
         torch.cuda.synchronize()
@@ -223,14 +223,17 @@ def measure_throughput(pipeline, duration_sec: int, prompt: str) -> Dict:
 
     device = next(pipeline.parameters()).device if hasattr(pipeline, 'parameters') else torch.device('cuda')
 
+    # 3 frames per block
+    frames_per_block = 3
+
     def get_noise():
-        return torch.randn(1, 16, 3, 60, 104, device=device, dtype=torch.bfloat16)
+        return torch.randn(1, frames_per_block, 16, 60, 104, device=device, dtype=torch.bfloat16)
 
     # Warmup
     for _ in range(WARMUP_FRAMES):
         noise = get_noise()
         with torch.no_grad():
-            _ = pipeline.inference(noise, [prompt], num_frames=1)
+            _ = pipeline.inference(noise, [prompt])
 
     torch.cuda.synchronize()
     start = time.perf_counter()
@@ -239,8 +242,8 @@ def measure_throughput(pipeline, duration_sec: int, prompt: str) -> Dict:
     while time.perf_counter() - start < duration_sec:
         noise = get_noise()
         with torch.no_grad():
-            _ = pipeline.inference(noise, [prompt], num_frames=1)
-        frames += 1
+            _ = pipeline.inference(noise, [prompt])
+        frames += frames_per_block  # Count actual frames generated
 
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
@@ -323,15 +326,50 @@ def load_pipeline(config_path: str, optimized: bool = False, preset: str = "bala
         Pipeline instance
     """
     from omegaconf import OmegaConf
+    import peft
 
     # Load LongLive config
     config = OmegaConf.load(config_path)
+    device = torch.device("cuda")
 
     # Import LongLive pipeline
     from pipeline.causal_inference import CausalInferencePipeline
+    from utils.lora_utils import configure_lora_for_model
 
-    # Create base pipeline (this loads the model)
-    pipeline = CausalInferencePipeline.from_config(config)
+    # Create base pipeline
+    pipeline = CausalInferencePipeline(config, device=device)
+
+    # Load generator checkpoint
+    if config.generator_ckpt:
+        state_dict = torch.load(config.generator_ckpt, map_location="cpu")
+        if "generator" in state_dict or "generator_ema" in state_dict:
+            raw_gen_state_dict = state_dict["generator_ema" if config.use_ema else "generator"]
+        elif "model" in state_dict:
+            raw_gen_state_dict = state_dict["model"]
+        else:
+            raise ValueError(f"Generator state dict not found in {config.generator_ckpt}")
+        pipeline.generator.load_state_dict(raw_gen_state_dict)
+
+    # Apply LoRA if configured
+    if getattr(config, "adapter", None):
+        pipeline.generator.model = configure_lora_for_model(
+            pipeline.generator.model,
+            model_name="generator",
+            lora_config=config.adapter,
+            is_main_process=True,
+        )
+        lora_ckpt_path = getattr(config, "lora_ckpt", None)
+        if lora_ckpt_path:
+            lora_checkpoint = torch.load(lora_ckpt_path, map_location="cpu")
+            if isinstance(lora_checkpoint, dict) and "generator_lora" in lora_checkpoint:
+                peft.set_peft_model_state_dict(pipeline.generator.model, lora_checkpoint["generator_lora"])
+            else:
+                peft.set_peft_model_state_dict(pipeline.generator.model, lora_checkpoint)
+
+    # Move to device
+    pipeline = pipeline.to(dtype=torch.bfloat16)
+    pipeline.generator.to(device=device)
+    pipeline.vae.to(device=device)
 
     if optimized:
         from optimizations import OptimizedCausalInferencePipeline, OptimizationConfig
