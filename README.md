@@ -690,12 +690,29 @@ This is the detailed log of optimizations tested, with actual measured results.
 
 *Speed preset is slower than Balanced because Quantized KV is not actually used in attention computation.
 
+### Ablation Study Results (H100)
+
+| Test | Configuration | Mean (ms) | FPS | Memory | Notes |
+|------|--------------|-----------|-----|--------|-------|
+| **Sync Elimination** | With syncs | 772.7 | 3.9 | 21.44 GB | Baseline |
+| | Without syncs | 771.2 | 3.9 | 21.44 GB | **0.2% improvement** |
+| **Window Size** | 6 frames | 774.5 | 3.9 | 21.44 GB | Minimal impact |
+| | 8 frames | 776.7 | 3.9 | 21.44 GB | |
+| | 10 frames | 774.3 | 3.9 | 21.44 GB | |
+| | 12 frames (default) | 773.0 | 3.9 | 21.44 GB | Best quality |
+| **Precision** | BF16 (default) | 775.1 | 3.9 | 21.44 GB | Recommended |
+| | FP16 | FAILED | - | - | Type mismatch |
+| | FP8 | N/A | - | - | Requires TransformerEngine |
+
 ### Key Insights
 
 1. **torch.compile is the only significant optimization** - provides 23% latency reduction
 2. **Other optimizations are marginal** - prompt cache, memory pool, async VAE combined give ~4%
 3. **CUDA Graphs incompatible** - PEFT/LoRA hooks and dynamic KV indices break graph capture
 4. **Quantized KV not integrated** - allocates buffers but attention still uses FP16/BF16
+5. **Window size has negligible latency impact** - all sizes within measurement noise (~1%)
+6. **Sync elimination provides minimal benefit** - only 0.2% improvement
+7. **FP16 incompatible with current model** - BF16 biases require BF16 inputs
 
 ---
 
