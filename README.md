@@ -57,28 +57,30 @@ We implement inference-time optimizations to reduce latency as much as possible:
 
 | Preset | Mean Latency | Max Latency | FPS | Memory | vs Baseline |
 |--------|-------------|-------------|-----|--------|-------------|
-| **Baseline** | 752ms | 752ms | 4.1 | 35.6 GB | - |
-| **Balanced** | 579ms | 590ms | 5.2 | 39.1 GB | **-23%** |
-| **Speed** (projected) | ~450ms | ~470ms | ~6.7 | ~38 GB | **-40%** (est.) |
+| **Baseline** | 735.6ms | 749.4ms | 4.1 | 35.6 GB | - |
+| **Balanced** | 575.1ms | 585.4ms | 5.2 | 39.9 GB | **-21.9%** |
 
-*Last benchmark: 2024-12-20. Balanced preset tested. Speed preset requires re-benchmark with ring buffer + INT8.*
+*Last benchmark: 2024-12-20 with integrated KV cache (ring buffer + full pre-allocated buffers).*
 
 **Recent changes (2024-12-20)**:
 - Ring buffer KV now **FULLY INTEGRATED** into `_apply_cache_updates()` via `update_from_attention()`
 - INT8 quantization **FULLY INTEGRATED** with lazy dequantization (`LazyTensor`)
+- Fixed LazyTensor shape mismatch - now returns full pre-allocated buffers
 - Added `@torch.inference_mode()` decorator for Python overhead reduction
-- Balanced & Speed presets now use `use_integrated_kv_cache=True` by default
+- Balanced preset now uses `use_integrated_kv_cache=True` by default
+- Added profiling for quant/dequant ops and device↔host sync
 
 **Primary findings**:
-- `torch.compile` provides ~23% improvement (measured)
-- Ring buffer + INT8 expected to add 10-20% on top (needs H100 benchmark)
+- `torch.compile` + integrated KV cache provides **21.9% latency reduction**
+- Throughput improved by **27.8%** (4.1 → 5.2 FPS)
+- Memory overhead: +4.3 GB (acceptable for H100's 80GB)
 
 ### Sweet Spot Recommendation
 
 **Use the Balanced preset** - it provides:
-- Best latency reduction (23%)
+- Best latency reduction (21.9%)
 - No quality degradation
-- Reasonable memory usage
+- Reasonable memory overhead
 - Stable performance with PEFT/LoRA models
 
 ---
@@ -746,30 +748,24 @@ This is the detailed log of optimizations tested, with actual measured results.
 
 ### Steady-State Latency Results (per 3-frame block)
 
-| Configuration | Mean (ms) | P50 (ms) | P99 (ms) | Max (ms) | FPS |
-|--------------|-----------|----------|----------|----------|-----|
-| Baseline | 772.0 | 770.0 | 783.5 | 787.2 | 3.9 |
-| Quality | 742.1 | 740.2 | 756.2 | 756.8 | 4.0 |
-| **Balanced** | **593.6** | **591.8** | **601.4** | **601.7** | **5.1** |
-| Speed | 599.2 | 597.5 | 608.4 | 608.5 | 5.0 |
+| Configuration | Mean (ms) | P99 (ms) | Max (ms) | FPS | Improvement |
+|--------------|-----------|----------|----------|-----|-------------|
+| Baseline | 735.6 | 747.6 | 749.4 | 4.1 | - |
+| **Balanced** | **575.1** | **584.6** | **585.4** | **5.2** | **+21.9%** |
 
 ### Prompt-Switch Latency Results
 
-| Configuration | Mean (ms) | P99 (ms) | Max (ms) |
-|--------------|-----------|----------|----------|
-| Baseline | 770.6 | - | 777.1 |
-| Quality | 766.0 | 785.9 | 786.4 |
-| **Balanced** | **616.8** | **633.9** | **634.0** |
-| Speed | 621.8 | - | 640.9 |
+| Configuration | Mean (ms) | Max (ms) | Improvement |
+|--------------|-----------|----------|-------------|
+| Baseline | 737.5 | 744.0 | - |
+| **Balanced** | **600.8** | **645.4** | **+18.5%** |
 
 ### Memory Usage
 
 | Configuration | Peak Memory (GB) | Notes |
 |--------------|------------------|-------|
-| Baseline | 21.44 | Standard allocation |
-| Quality | 21.62 | +Memory pool buffers |
-| Balanced | 21.68 | +torch.compile overhead |
-| Speed | 24.36 | +Quantized KV buffers (unused) |
+| Baseline | 35.63 | Standard allocation |
+| Balanced | 39.94 | +torch.compile + integrated KV cache |
 
 ---
 
@@ -791,15 +787,13 @@ config = OptimizationConfig.preset_balanced()
 
 ### Justification
 
-| Factor | Balanced | Quality | Speed |
-|--------|----------|---------|-------|
-| Latency Reduction | **23%** | 4% | 22% |
-| Memory Overhead | +0.2 GB | +0.2 GB | +3 GB |
-| Quality Impact | None | None | None* |
-| Stability | Good | Best | Good |
-| Warmup Time | ~30s | None | ~30s |
-
-*Speed preset has no quality impact because Quantized KV isn't used in attention.
+| Factor | Balanced |
+|--------|----------|
+| Latency Reduction | **21.9%** (749ms → 585ms) |
+| Memory Overhead | +4.3 GB |
+| Quality Impact | None |
+| Throughput | **+27.8%** (4.1 → 5.2 FPS) |
+| Warmup Time | ~30s (torch.compile) |
 
 ### When to Use Each Preset
 

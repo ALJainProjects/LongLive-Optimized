@@ -111,6 +111,33 @@ class LatencyProfiler:
         self.prompt_switch_start: Optional[torch.cuda.Event] = None
         self.prompt_switch_end: Optional[torch.cuda.Event] = None
 
+        # Device-host sync tracking
+        self._sync_time_ms = 0.0
+        self._sync_count = 0
+
+    def measure_sync(self):
+        """Measure a device↔host synchronization."""
+        if not self.enabled:
+            return
+
+        if torch.cuda.is_available():
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            torch.cuda.synchronize()
+            end.record()
+            end.synchronize()  # Wait for end event
+            self._sync_time_ms += start.elapsed_time(end)
+            self._sync_count += 1
+
+    def get_sync_stats(self) -> Dict:
+        """Get synchronization statistics."""
+        return {
+            'total_sync_time_ms': self._sync_time_ms,
+            'sync_count': self._sync_count,
+            'avg_sync_ms': self._sync_time_ms / max(1, self._sync_count),
+        }
+
     def reset(self):
         """Clear all measurements and reset state."""
         self.measurements.clear()
@@ -120,6 +147,8 @@ class LatencyProfiler:
         self.current_frame_idx = 0
         self.prompt_switch_start = None
         self.prompt_switch_end = None
+        self._sync_time_ms = 0.0
+        self._sync_count = 0
 
     @contextmanager
     def measure(self, name: str):
@@ -325,6 +354,15 @@ class LatencyProfiler:
             print("\nPrompt Switch Latency:")
             print("-" * 70)
             print(f"  Latency: {ps_latency:.2f} ms")
+
+        # Print sync stats
+        sync_stats = self.get_sync_stats()
+        if sync_stats['sync_count'] > 0:
+            print("\nDevice↔Host Sync:")
+            print("-" * 70)
+            print(f"  Total: {sync_stats['total_sync_time_ms']:.2f} ms")
+            print(f"  Count: {sync_stats['sync_count']}")
+            print(f"  Avg:   {sync_stats['avg_sync_ms']:.2f} ms/sync")
 
         print("=" * 70 + "\n")
 

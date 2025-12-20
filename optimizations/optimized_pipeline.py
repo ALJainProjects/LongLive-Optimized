@@ -788,6 +788,18 @@ class OptimizedCausalInferencePipeline:
         print(f"  torch.compile:  {'✓' if self._compiled else '✗'}")
         print(f"  Sync-Free:      {'✓' if self._use_sync_free else '✗'}")
 
+        # Print quant/dequant stats if using integrated KV with quantization
+        if self._use_integrated_kv and self._integrated_kv_quantize:
+            try:
+                from .integrated_kv_cache import IntegratedKVCache
+                if isinstance(self.base.kv_cache1, IntegratedKVCache):
+                    stats = self.base.kv_cache1.get_all_quant_stats()
+                    print(f"\nQuant/Dequant Stats:")
+                    print(f"  Quantize:   {stats['total_quant_time_ms']:.2f}ms ({stats['total_quant_count']} ops, avg {stats['avg_quant_ms']:.3f}ms)")
+                    print(f"  Dequantize: {stats['total_dequant_time_ms']:.2f}ms ({stats['total_dequant_count']} ops, avg {stats['avg_dequant_ms']:.3f}ms)")
+            except Exception:
+                pass
+
         print(f"{'='*60}")
 
     def switch_prompt(self, new_prompts: List[str]) -> None:

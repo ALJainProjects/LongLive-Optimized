@@ -44,6 +44,10 @@ class LazyTensor:
     this and return the appropriate tensor without full copies.
     """
 
+    # Class-level profiling stats
+    _total_dequant_time_ms = 0.0
+    _total_dequant_count = 0
+
     def __init__(
         self,
         data: torch.Tensor,
@@ -63,11 +67,33 @@ class LazyTensor:
             return self._materialized
 
         if self._is_quantized and self._scale is not None:
-            # Dequantize: INT8 * scale -> target_dtype
+            # Dequantize: INT8 * scale -> target_dtype with timing
+            if torch.cuda.is_available():
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+
             self._materialized = (self._data.float() * self._scale).to(self._target_dtype)
+
+            if torch.cuda.is_available():
+                end.record()
+                torch.cuda.synchronize()
+                LazyTensor._total_dequant_time_ms += start.elapsed_time(end)
+                LazyTensor._total_dequant_count += 1
         else:
             self._materialized = self._data
         return self._materialized
+
+    @classmethod
+    def get_dequant_stats(cls) -> Tuple[float, int]:
+        """Get cumulative dequantization stats."""
+        return cls._total_dequant_time_ms, cls._total_dequant_count
+
+    @classmethod
+    def reset_dequant_stats(cls):
+        """Reset dequantization stats."""
+        cls._total_dequant_time_ms = 0.0
+        cls._total_dequant_count = 0
 
     def clone(self) -> torch.Tensor:
         """Return a clone - this is where we optimize."""
@@ -110,6 +136,12 @@ class IntegratedKVCacheLayer(dict):
         self.config = config
         self.device = torch.device(config.device)
 
+        # Profiling counters for quant/dequant
+        self._quant_time_ms = 0.0
+        self._dequant_time_ms = 0.0
+        self._quant_count = 0
+        self._dequant_count = 0
+
         # Calculate sizes
         self.sink_size = config.sink_frames * config.frame_seq_length
         self.local_size = config.local_window_frames * config.frame_seq_length
@@ -147,16 +179,18 @@ class IntegratedKVCacheLayer(dict):
 
     def _update_dict_values(self):
         """Update the dict values with current state."""
-        # Provide the full buffer views - the LazyTensor handles cloning
+        # Provide the FULL buffer - the original code expects pre-allocated
+        # full-size buffers and uses local_end_index/global_end_index to
+        # track valid positions. Slicing causes shape mismatches.
         super().__setitem__('k', LazyTensor(
-            self._k_buffer[:, :self._get_valid_len()],
-            self._k_scale[:, :self._get_valid_len()] if self._k_scale is not None else None,
+            self._k_buffer,  # Full buffer, not sliced
+            self._k_scale if self._k_scale is not None else None,
             is_quantized=self.config.use_quantization,
             target_dtype=self.config.dtype,
         ))
         super().__setitem__('v', LazyTensor(
-            self._v_buffer[:, :self._get_valid_len()],
-            self._v_scale[:, :self._get_valid_len()] if self._v_scale is not None else None,
+            self._v_buffer,  # Full buffer, not sliced
+            self._v_scale if self._v_scale is not None else None,
             is_quantized=self.config.use_quantization,
             target_dtype=self.config.dtype,
         ))
@@ -171,10 +205,22 @@ class IntegratedKVCacheLayer(dict):
 
     def _quantize_int8(self, tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize tensor to INT8 with per-token scaling."""
+        if torch.cuda.is_available():
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+
         # Per-token scale: max absolute value per token
         scale = tensor.abs().amax(dim=(-2, -1), keepdim=True) / 127.0
         scale = scale.clamp(min=1e-8)
         quantized = (tensor / scale).round().clamp(-128, 127).to(torch.int8)
+
+        if torch.cuda.is_available():
+            end.record()
+            torch.cuda.synchronize()
+            self._quant_time_ms += start.elapsed_time(end)
+            self._quant_count += 1
+
         return quantized, scale.float()
 
     def update_cache(
@@ -384,6 +430,19 @@ class IntegratedKVCacheLayer(dict):
 
         return buffer_bytes
 
+    def get_quant_stats(self) -> Dict[str, float]:
+        """Get quantization profiling stats."""
+        return {
+            'quant_time_ms': self._quant_time_ms,
+            'quant_count': self._quant_count,
+            'avg_quant_ms': self._quant_time_ms / max(1, self._quant_count),
+        }
+
+    def reset_quant_stats(self):
+        """Reset quantization stats."""
+        self._quant_time_ms = 0.0
+        self._quant_count = 0
+
 
 class IntegratedKVCache(list):
     """
@@ -427,6 +486,28 @@ class IntegratedKVCache(list):
         bf16_total = bf16_per_layer * self.config.num_layers
 
         return 1.0 - (current / bf16_total) if bf16_total > 0 else 0.0
+
+    def get_all_quant_stats(self) -> Dict[str, float]:
+        """Get aggregated quant/dequant stats across all layers."""
+        total_quant_time = sum(layer._quant_time_ms for layer in self)
+        total_quant_count = sum(layer._quant_count for layer in self)
+
+        dequant_time, dequant_count = LazyTensor.get_dequant_stats()
+
+        return {
+            'total_quant_time_ms': total_quant_time,
+            'total_quant_count': total_quant_count,
+            'avg_quant_ms': total_quant_time / max(1, total_quant_count),
+            'total_dequant_time_ms': dequant_time,
+            'total_dequant_count': dequant_count,
+            'avg_dequant_ms': dequant_time / max(1, dequant_count),
+        }
+
+    def reset_all_stats(self):
+        """Reset all profiling stats."""
+        for layer in self:
+            layer.reset_quant_stats()
+        LazyTensor.reset_dequant_stats()
 
 
 def create_integrated_kv_cache(
