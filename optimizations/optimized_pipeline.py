@@ -42,6 +42,7 @@ from .memory_pool import LongLiveMemoryPool, BufferSpec
 from .cuda_graphs import CUDAGraphWrapper, GraphCaptureConfig
 from .sync_elimination import SyncFreeContext
 from .quantized_kv import QuantizedKVCache, quantize_int8, dequantize_int8
+from .kv_cache_wrapper import QuantizedKVCacheList, create_quantized_kv_cache
 
 
 class OptimizedCausalInferencePipeline:
@@ -460,77 +461,31 @@ class OptimizedCausalInferencePipeline:
         dtype: torch.dtype,
         device: torch.device,
         kv_cache_size: int,
-    ) -> List[dict]:
+    ) -> QuantizedKVCacheList:
         """
-        Initialize KV cache with INT8/FP8 quantization for memory bandwidth savings.
+        Initialize KV cache with INT8 quantization for memory bandwidth savings.
 
-        Returns the same List[dict] format as base pipeline, but with a wrapper
-        that quantizes on store and dequantizes on load. This provides ~2x memory
-        bandwidth reduction with minimal quality impact.
+        Uses QuantizedKVCacheList wrapper that transparently handles quantization:
+        - Values are quantized to INT8 when stored
+        - Values are dequantized to target dtype when read
+        - Provides ~2x memory bandwidth reduction with minimal quality impact
 
-        Note: This is a "lazy quantization" approach - we store quantized values
-        in separate buffers and dequantize on-the-fly during attention computation.
-        For maximum benefit, the generator would need modification to use quantized
-        attention directly.
+        Note: Full quantization benefits require the generator to use the wrapper's
+        quantized storage. Current implementation provides infrastructure but may
+        not achieve full bandwidth savings without generator modifications.
         """
         with self.profiler.measure("kv_cache_init_quantized"):
-            kv_cache = []
-
-            for layer_idx in range(self.num_transformer_blocks):
-                # Allocate standard buffers (these will hold dequantized values)
-                k_buffer = torch.zeros(
-                    [batch_size, kv_cache_size, 12, 128],
-                    dtype=dtype,
-                    device=device
-                )
-                v_buffer = torch.zeros(
-                    [batch_size, kv_cache_size, 12, 128],
-                    dtype=dtype,
-                    device=device
-                )
-
-                # Also allocate quantized buffers for storage (INT8 = 1/2 memory)
-                if self._kv_quantization == "int8":
-                    quant_dtype = torch.int8
-                else:  # fp8 - fall back to int8 if FP8 not available
-                    quant_dtype = torch.int8 if not hasattr(torch, 'float8_e4m3fn') else torch.float8_e4m3fn
-
-                # Create quantized storage (half the memory of bfloat16)
-                k_quant = torch.zeros(
-                    [batch_size, kv_cache_size, 12, 128],
-                    dtype=quant_dtype,
-                    device=device
-                )
-                v_quant = torch.zeros(
-                    [batch_size, kv_cache_size, 12, 128],
-                    dtype=quant_dtype,
-                    device=device
-                )
-
-                # Scales for dequantization (per-token)
-                k_scale = torch.ones(
-                    [batch_size, kv_cache_size, 1, 1],
-                    dtype=torch.float32,
-                    device=device
-                )
-                v_scale = torch.ones(
-                    [batch_size, kv_cache_size, 1, 1],
-                    dtype=torch.float32,
-                    device=device
-                )
-
-                kv_cache.append({
-                    "k": k_buffer,
-                    "v": v_buffer,
-                    "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                    "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                    # Quantized storage (extra fields, ignored by base pipeline)
-                    "_k_quant": k_quant,
-                    "_v_quant": v_quant,
-                    "_k_scale": k_scale,
-                    "_v_scale": v_scale,
-                    "_quantized": True,
-                })
+            # Use the wrapper that provides transparent quantization
+            kv_cache = create_quantized_kv_cache(
+                num_layers=self.num_transformer_blocks,
+                batch_size=batch_size,
+                kv_cache_size=kv_cache_size,
+                num_heads=12,  # LongLive default
+                head_dim=128,  # LongLive default
+                device=device,
+                dtype=dtype,
+                quantize=True,  # Enable quantization
+            )
 
             return kv_cache
 
