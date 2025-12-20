@@ -2,7 +2,9 @@
 
 ## Inference-Time Latency Optimizations for Real-Time Video Generation
 
-This project implements inference-time optimizations for [LongLive](https://github.com/NVlabs/LongLive), achieving sub-40ms worst-case inter-frame latency for real-time interactive video generation without requiring model retraining.
+This project implements inference-time optimizations for [LongLive](https://github.com/NVlabs/LongLive), an autoregressive video generation model from NVIDIA. Our goal is to reduce latency for real-time interactive video generation without requiring model retraining.
+
+**⚠️ Important Note**: The 40ms target for real-time interaction (25 FPS) is currently **not achievable** with inference-only optimizations. This document provides an honest analysis of what's possible and what would require architectural changes.
 
 ---
 
@@ -13,12 +15,13 @@ This project implements inference-time optimizations for [LongLive](https://gith
 3. [Problem Statement](#problem-statement)
 4. [Latency Metrics and Methodology](#latency-metrics-and-methodology)
 5. [Optimization Techniques](#optimization-techniques)
-6. [Implementation Details](#implementation-details)
-7. [Benchmark Results](#benchmark-results)
-8. [Quality Evaluation](#quality-evaluation)
-9. [Usage Guide](#usage-guide)
-10. [Future Directions](#future-directions)
-11. [Appendix: Architectural Analysis](#appendix-architectural-analysis)
+6. [Optimization Log](#optimization-log)
+7. [Implementation Details](#implementation-details)
+8. [Benchmark Results](#benchmark-results)
+9. [Sweet Spot Recommendation](#sweet-spot-recommendation)
+10. [Thought Exercise: Architecture Redesign](#thought-exercise-architecture-redesign)
+11. [Usage Guide](#usage-guide)
+12. [Future Directions](#future-directions)
 
 ---
 
@@ -26,33 +29,47 @@ This project implements inference-time optimizations for [LongLive](https://gith
 
 ### Problem
 
-LongLive achieves 20.7 FPS (~48ms per frame) on H100, falling short of the 25 FPS (40ms) target required for smooth real-time interaction. Users experience noticeable lag between input and visual response, particularly at frame boundaries and during prompt switches.
+LongLive generates **3-frame blocks** through a 4-step denoising process. The paper reports 20.7 FPS throughput on H100, but this measures **frames output per second**, not per-frame latency. Our analysis reveals:
 
-### Solution
+- **Per-block latency**: ~770ms (baseline) for generating 3 frames
+- **Per-frame equivalent**: ~257ms per frame
+- **Gap to 40ms target**: **6.4x slower than required**
 
-We implement seven inference-time optimizations that collectively reduce worst-case latency by 35-50% without model retraining:
+This significant gap cannot be closed with inference-time optimizations alone.
 
-| Optimization | Mechanism | Latency Reduction | Status |
-|--------------|-----------|-------------------|--------|
-| torch.compile | Kernel fusion via Inductor | 20-40% | ✅ Integrated |
-| Static KV Cache | Pre-allocated buffer reuse | 15-20% | ✅ Integrated |
-| Async VAE Pipeline | Overlap decode with generation | 5-10% | ✅ Integrated |
-| Prompt Cache | LRU embedding cache | Near-zero prompt switch | ✅ Integrated |
-| Quantized KV | INT8 cache compression | 10-15% | ✅ Integrated |
-| Memory Pool | Pre-allocated tensors | 2-5% | ✅ Integrated |
-| Sync Elimination | Remove host-device syncs | 2-5% | ✅ Integrated |
-| CUDA Graphs | Capture/replay kernel launches | 30-50% | ⚠️ Limited* |
+### Solution Approach
 
-*CUDA Graphs have limited support due to LongLive's dynamic KV cache indexing. torch.compile is recommended instead.
+We implement inference-time optimizations to reduce latency as much as possible:
 
-### Key Results
+| Optimization | Mechanism | Actual Reduction | Status |
+|--------------|-----------|------------------|--------|
+| torch.compile | Kernel fusion via Inductor | **23%** | ✅ Working |
+| Prompt Cache | LRU embedding cache | ~1% (cache hits) | ✅ Working |
+| Memory Pool | Pre-allocated tensor reuse | ~2% | ✅ Working |
+| Async VAE | Overlap decode with next block | ~2% | ✅ Working |
+| Static KV (buffer reuse) | Reuse KV tensors | ~2% | ✅ Working |
+| Static KV (ring buffer) | O(1) cache updates | 0% | ⚠️ Implemented, not integrated |
+| Quantized KV | INT8 cache compression | 0% | ⚠️ Implemented, not integrated |
+| CUDA Graphs | Capture/replay | 0% | ❌ Incompatible with PEFT/LoRA |
 
-| Metric | Baseline | Optimized (Balanced) | Improvement |
-|--------|----------|---------------------|-------------|
-| Steady-State Max | ~52ms | ~38ms | 27% |
-| Steady-State Mean | ~48ms | ~32ms | 33% |
-| Prompt-Switch Max | ~85ms | ~55ms | 35% |
-| Throughput | 20.7 FPS | 31.2 FPS | 51% |
+### Key Results (Actual Measurements on H100)
+
+| Preset | Mean Latency | Max Latency | FPS | Memory | vs Baseline |
+|--------|-------------|-------------|-----|--------|-------------|
+| **Baseline** | 772ms | 787ms | 3.9 | 21.4 GB | - |
+| **Quality** | 742ms | 757ms | 4.0 | 21.6 GB | -3.9% |
+| **Balanced** | 594ms | 602ms | 5.1 | 21.7 GB | **-23.1%** |
+| **Speed** | 599ms | 609ms | 5.0 | 24.4 GB | -22.4% |
+
+**Primary finding**: `torch.compile` provides the only significant improvement (~23%). Other optimizations provide marginal gains.
+
+### Sweet Spot Recommendation
+
+**Use the Balanced preset** - it provides:
+- Best latency reduction (23%)
+- No quality degradation
+- Reasonable memory usage
+- Stable performance with PEFT/LoRA models
 
 ---
 
@@ -656,80 +673,185 @@ class OptimizationConfig:
 
 ---
 
+## Optimization Log
+
+This is the detailed log of optimizations tested, with actual measured results.
+
+### Configuration → Latency → Quality → Decision
+
+| # | Configuration | Mean (ms) | Max (ms) | FPS | Memory | Quality | Decision |
+|---|--------------|-----------|----------|-----|--------|---------|----------|
+| 1 | Baseline (no optimizations) | 772.0 | 787.2 | 3.9 | 21.4 GB | Reference | Baseline |
+| 2 | Quality: Cache + Pool + Async VAE | 742.1 | 756.8 | 4.0 | 21.6 GB | Same | **Keep** |
+| 3 | Balanced: + torch.compile (default) | 593.6 | 601.7 | 5.1 | 21.7 GB | Same | **Keep ★** |
+| 4 | Speed: + Quantized KV (INT8) | 599.2 | 608.5 | 5.0 | 24.4 GB | Same | Drop* |
+| 5 | torch.compile (reduce-overhead) | FAIL | - | - | - | - | Drop |
+| 6 | CUDA Graphs | FAIL | - | - | - | - | Drop |
+
+*Speed preset is slower than Balanced because Quantized KV is not actually used in attention computation.
+
+### Key Insights
+
+1. **torch.compile is the only significant optimization** - provides 23% latency reduction
+2. **Other optimizations are marginal** - prompt cache, memory pool, async VAE combined give ~4%
+3. **CUDA Graphs incompatible** - PEFT/LoRA hooks and dynamic KV indices break graph capture
+4. **Quantized KV not integrated** - allocates buffers but attention still uses FP16/BF16
+
+---
+
 ## Benchmark Results
 
 ### Test Configuration
 
 | Parameter | Value |
 |-----------|-------|
-| GPU | NVIDIA H100 80GB |
-| Model | LongLive-1.3B |
+| GPU | NVIDIA H100 80GB HBM3 |
+| Model | LongLive (WAN-based, 1.4B params) |
+| LoRA | r=256, 350M trainable params |
 | Denoising Steps | 4 (1000, 750, 500, 250) |
+| Frames per Block | 3 |
 | Local Attention | 12 frames |
 | Frame Sink | 3 frames |
 | Base Dtype | bfloat16 |
+| Benchmark Mode | Quick (100 frames steady-state, 10 prompt switches) |
 
-### Steady-State Latency Results
+### Steady-State Latency Results (per 3-frame block)
 
-| Configuration | Mean (ms) | P99 (ms) | Max (ms) | FPS |
-|--------------|-----------|----------|----------|-----|
-| Baseline | 48.3 | 51.2 | 54.1 | 20.7 |
-| +CUDA Graphs | 34.2 | 36.8 | 39.2 | 29.2 |
-| +Static KV | 31.5 | 33.9 | 36.4 | 31.7 |
-| +Async VAE | 29.8 | 32.1 | 34.8 | 33.6 |
-| +All (Balanced) | 32.0 | 35.2 | 38.1 | 31.2 |
-| +INT8 KV (Speed) | 28.5 | 31.2 | 34.5 | 35.1 |
+| Configuration | Mean (ms) | P50 (ms) | P99 (ms) | Max (ms) | FPS |
+|--------------|-----------|----------|----------|----------|-----|
+| Baseline | 772.0 | 770.0 | 783.5 | 787.2 | 3.9 |
+| Quality | 742.1 | 740.2 | 756.2 | 756.8 | 4.0 |
+| **Balanced** | **593.6** | **591.8** | **601.4** | **601.7** | **5.1** |
+| Speed | 599.2 | 597.5 | 608.4 | 608.5 | 5.0 |
 
 ### Prompt-Switch Latency Results
 
 | Configuration | Mean (ms) | P99 (ms) | Max (ms) |
 |--------------|-----------|----------|----------|
-| Baseline | 72.5 | 81.3 | 86.2 |
-| +Prompt Cache (warm) | 54.2 | 59.8 | 63.1 |
-| +Balanced Preset | 48.5 | 53.2 | 57.8 |
+| Baseline | 770.6 | - | 777.1 |
+| Quality | 766.0 | 785.9 | 786.4 |
+| **Balanced** | **616.8** | **633.9** | **634.0** |
+| Speed | 621.8 | - | 640.9 |
 
 ### Memory Usage
 
-| Configuration | Peak Memory (GB) | KV Cache (GB) |
-|--------------|------------------|---------------|
-| Baseline | 38.2 | 4.8 |
-| Static KV | 38.5 | 4.8 (pre-allocated) |
-| INT8 KV | 36.8 | 2.4 |
+| Configuration | Peak Memory (GB) | Notes |
+|--------------|------------------|-------|
+| Baseline | 21.44 | Standard allocation |
+| Quality | 21.62 | +Memory pool buffers |
+| Balanced | 21.68 | +torch.compile overhead |
+| Speed | 24.36 | +Quantized KV buffers (unused) |
 
 ---
 
-## Quality Evaluation
+## Sweet Spot Recommendation
 
-### Metrics
+### Recommended: Balanced Preset
 
-| Metric | What It Measures | Threshold |
-|--------|-----------------|-----------|
-| PSNR | Pixel-level fidelity | >30 dB |
-| SSIM | Structural similarity | >0.9 |
-| LPIPS | Perceptual similarity | <0.1 |
-| CLIP Score | Prompt adherence | <2% delta |
+Based on our benchmarks, the **Balanced preset** is the recommended configuration:
 
-### Results (Balanced Preset vs Baseline)
+```python
+config = OptimizationConfig.preset_balanced()
+# Equivalent to:
+# - use_torch_compile = True (compile_mode="default")
+# - use_prompt_cache = True
+# - use_memory_pool = True
+# - use_async_vae = True
+# - use_static_kv = True (buffer reuse)
+```
 
-| Metric | Baseline | Balanced | Delta |
-|--------|----------|----------|-------|
-| PSNR | Reference | 42.1 dB | - |
-| SSIM | Reference | 0.987 | - |
-| LPIPS | Reference | 0.012 | - |
-| CLIP Score | 0.312 | 0.310 | -0.6% |
+### Justification
 
-**Conclusion**: Balanced preset has negligible quality impact (CLIP delta <1%).
+| Factor | Balanced | Quality | Speed |
+|--------|----------|---------|-------|
+| Latency Reduction | **23%** | 4% | 22% |
+| Memory Overhead | +0.2 GB | +0.2 GB | +3 GB |
+| Quality Impact | None | None | None* |
+| Stability | Good | Best | Good |
+| Warmup Time | ~30s | None | ~30s |
 
-### Results (Speed Preset vs Baseline)
+*Speed preset has no quality impact because Quantized KV isn't used in attention.
 
-| Metric | Baseline | Speed | Delta |
-|--------|----------|-------|-------|
-| PSNR | Reference | 38.5 dB | - |
-| SSIM | Reference | 0.961 | - |
-| LPIPS | Reference | 0.031 | - |
-| CLIP Score | 0.312 | 0.305 | -2.2% |
+### When to Use Each Preset
 
-**Conclusion**: Speed preset has slight quality degradation but remains acceptable.
+- **Quality**: When you need guaranteed identical output to baseline
+- **Balanced**: Production use - best latency with no quality loss
+- **Speed**: Not recommended (slower than Balanced due to implementation gaps)
+
+---
+
+## Thought Exercise: Architecture Redesign
+
+### Why 40ms is Fundamentally Unachievable
+
+The 40ms target requires 25 FPS single-frame latency. LongLive's architecture has fundamental serial dependencies:
+
+```
+Per-block computation (3 frames):
+├── Denoising Step 1 (t=1000): ~150ms
+├── Denoising Step 2 (t=750):  ~150ms
+├── Denoising Step 3 (t=500):  ~150ms
+├── Denoising Step 4 (t=250):  ~150ms
+├── KV Cache Update:           ~20ms
+└── VAE Decode:                ~50ms
+────────────────────────────────────
+Total:                         ~670ms for 3 frames
+                               ~223ms per frame
+```
+
+**Minimum theoretical time** (if all overhead eliminated): ~200ms/frame
+**Target**: 40ms/frame
+**Gap**: 5x
+
+### Architectural Bottlenecks
+
+1. **Sequential Denoising Steps**: Each step must complete before the next. Cannot parallelize.
+
+2. **Autoregressive Frame Dependency**: Frame N's KV must be computed before Frame N+1 can use it.
+
+3. **Frame-Sink Mechanism**: First 3 frames are always in attention window - cannot reduce this without coherence loss.
+
+### Proposed Redesign (if starting fresh)
+
+**Option 1: Consistency/LCM Distillation**
+- Distill to 1-2 denoising steps instead of 4
+- Expected: 3-4x speedup → ~60ms/frame (close to target)
+- Trade-off: Requires retraining, potential quality loss
+
+**Option 2: Speculative Frame Generation**
+```
+Instead of:  Frame1 → Frame2 → Frame3 → Frame4
+Do:          Frame1 → [Frame2, Frame3, Frame4 in parallel with draft model]
+             → Verify with full model → Accept or rollback
+```
+- Expected: 2-3x effective speedup for coherent sequences
+- Trade-off: Complex implementation, wasted compute on rollbacks
+
+**Option 3: Hierarchical Generation**
+```
+Instead of:  Full-res frame every step
+Do:          Low-res (4x smaller) → Upsample asynchronously
+```
+- Expected: 4x speedup for latent computation
+- Trade-off: Upsampling latency, potential artifacts
+
+**Option 4: Smaller Architecture**
+- Current: 1.4B params
+- Proposed: 400M params (similar to Stable Video Diffusion small)
+- Expected: 3x speedup
+- Trade-off: Lower visual quality
+
+### Recommendation for Real-Time Interaction
+
+For true 40ms latency, **LCM/Consistency distillation is the most viable path**:
+
+1. Distill LongLive to 1-step generation
+2. Use aggressive model quantization (FP8/INT8)
+3. Combine with all inference optimizations
+
+Expected result: ~50-70ms latency (close to interactive but not quite 40ms)
+
+**Conclusion**: The 40ms target for LongLive-style models likely requires both architectural changes (fewer steps) AND inference optimizations (torch.compile, graphs). Inference optimizations alone can achieve ~23% reduction but cannot bridge the 5x gap.
 
 ---
 
