@@ -208,7 +208,6 @@ class OptimizedCausalInferencePipeline:
                 # Enable suppress_errors to fall back to eager mode for unsupported ops
                 # This is critical for PEFT/LoRA compatibility - PEFT hooks are not
                 # supported by torch.compile and would otherwise cause runtime failures
-                import torch._dynamo
                 torch._dynamo.config.suppress_errors = True
 
                 # Check if model uses PEFT and warn user
