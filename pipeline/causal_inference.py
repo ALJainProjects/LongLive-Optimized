@@ -239,11 +239,26 @@ class CausalInferencePipeline(torch.nn.Module):
         else:
             return video
 
-    def _initialize_kv_cache(self, batch_size, dtype, device, kv_cache_size_override: int | None = None):
+    def _initialize_kv_cache(
+        self,
+        batch_size,
+        dtype,
+        device,
+        kv_cache_size_override: int | None = None,
+        use_integrated_cache: bool = False,
+        use_quantization: bool = False,
+    ):
         """
         Initialize a Per-GPU KV cache for the Wan model.
+
+        Args:
+            batch_size: Batch size
+            dtype: Data type for cache tensors
+            device: Device to create tensors on
+            kv_cache_size_override: Override the default cache size
+            use_integrated_cache: If True, use IntegratedKVCache with ring buffer
+            use_quantization: If True and use_integrated_cache, enable INT8 quantization
         """
-        kv_cache1 = []
         # Determine cache size
         if kv_cache_size_override is not None:
             kv_cache_size = kv_cache_size_override
@@ -255,6 +270,35 @@ class CausalInferencePipeline(torch.nn.Module):
                 # Global attention: default cache for 21 frames (backward compatibility)
                 kv_cache_size = 32760
 
+        if use_integrated_cache:
+            # Use IntegratedKVCache with ring buffer and optional INT8 quantization
+            try:
+                from optimizations.integrated_kv_cache import create_integrated_kv_cache
+                # Calculate local window frames from cache size
+                local_window_frames = kv_cache_size // self.frame_seq_length
+                sink_frames = getattr(self.args.model_kwargs, 'sink_size', 3)
+
+                self.kv_cache1 = create_integrated_kv_cache(
+                    num_layers=self.num_transformer_blocks,
+                    num_heads=12,
+                    head_dim=128,
+                    local_window_frames=local_window_frames - sink_frames,
+                    sink_frames=sink_frames,
+                    frame_seq_length=self.frame_seq_length,
+                    batch_size=batch_size,
+                    use_ring_buffer=True,
+                    use_quantization=use_quantization,
+                    dtype=dtype,
+                    device=str(device),
+                )
+                print(f"Using IntegratedKVCache (ring_buffer=True, quantization={use_quantization})")
+                return
+            except ImportError as e:
+                print(f"Warning: Could not import IntegratedKVCache: {e}")
+                print("Falling back to standard KV cache")
+
+        # Standard KV cache (list of dicts)
+        kv_cache1 = []
         for _ in range(self.num_transformer_blocks):
             kv_cache1.append({
                 "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),

@@ -63,8 +63,8 @@ class LazyTensor:
             return self._materialized
 
         if self._is_quantized and self._scale is not None:
-            # Dequantize
-            self._materialized = self._data.to(self._target_dtype) * self._scale
+            # Dequantize: INT8 * scale -> target_dtype
+            self._materialized = (self._data.float() * self._scale).to(self._target_dtype)
         else:
             self._materialized = self._data
         return self._materialized
@@ -237,6 +237,128 @@ class IntegratedKVCacheLayer(dict):
         self._local_end = local_end
 
         # Update dict values
+        self._update_dict_values()
+
+    def get_attention_kv(
+        self,
+        sink_tokens: int,
+        local_end_index: int,
+        max_attention_size: int,
+    ) -> tuple:
+        """
+        Get K, V tensors ready for attention computation.
+
+        This handles ring buffer wraparound and returns contiguous views
+        without unnecessary cloning.
+
+        Args:
+            sink_tokens: Number of sink tokens (always at start of buffer)
+            local_end_index: Current local end index
+            max_attention_size: Maximum attention window size
+
+        Returns:
+            (k_for_attention, v_for_attention): Tensors ready for attention
+        """
+        # For now, simple implementation that reads from buffer
+        # The ring buffer stores sink + local window contiguously
+        # Sink tokens are always at indices [0:sink_tokens]
+        # Local window is at indices [sink_tokens:local_end_index]
+
+        if self.config.use_quantization and self._k_scale is not None:
+            # Dequantize on read
+            k = self._k_buffer[:, :local_end_index].to(self.config.dtype) * self._k_scale[:, :local_end_index]
+            v = self._v_buffer[:, :local_end_index].to(self.config.dtype) * self._v_scale[:, :local_end_index]
+        else:
+            # Return view (no copy)
+            k = self._k_buffer[:, :local_end_index]
+            v = self._v_buffer[:, :local_end_index]
+
+        # Apply attention windowing
+        if sink_tokens > 0:
+            local_budget = max_attention_size - sink_tokens
+            k_sink = k[:, :sink_tokens]
+            v_sink = v[:, :sink_tokens]
+
+            if local_budget > 0:
+                local_start = max(sink_tokens, local_end_index - local_budget)
+                k_local = k[:, local_start:local_end_index]
+                v_local = v[:, local_start:local_end_index]
+                k_cat = torch.cat([k_sink, k_local], dim=1)
+                v_cat = torch.cat([v_sink, v_local], dim=1)
+            else:
+                k_cat = k_sink
+                v_cat = v_sink
+            return k_cat, v_cat
+        else:
+            window_start = max(0, local_end_index - max_attention_size)
+            return k[:, window_start:local_end_index], v[:, window_start:local_end_index]
+
+    def update_from_attention(
+        self,
+        new_k: torch.Tensor,
+        new_v: torch.Tensor,
+        write_start_index: int,
+        write_end_index: int,
+        global_end: int,
+        local_end: int,
+        do_roll: bool = False,
+        sink_tokens: int = 0,
+        num_rolled_tokens: int = 0,
+        num_evicted_tokens: int = 0,
+    ):
+        """
+        Update cache from attention computation results.
+
+        This is the O(1) ring buffer update - no rolling needed.
+        The attention code computes the new KV, we just store them.
+
+        Args:
+            new_k, new_v: New key/value tensors to store
+            write_start_index, write_end_index: Where to write in buffer
+            global_end, local_end: Updated cache indices
+            do_roll: Whether rolling was needed (for compatibility)
+            sink_tokens, num_rolled_tokens, num_evicted_tokens: Rolling params (for compatibility)
+        """
+        write_len = write_end_index - write_start_index
+        if write_len <= 0:
+            return
+
+        # Handle rolling if needed (when cache is full)
+        if do_roll and num_rolled_tokens > 0:
+            # Ring buffer approach: instead of shifting, we just update write pointer
+            # But for compatibility with current attention code, do the shift
+            self._k_buffer[:, sink_tokens:sink_tokens + num_rolled_tokens].copy_(
+                self._k_buffer[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens]
+            )
+            self._v_buffer[:, sink_tokens:sink_tokens + num_rolled_tokens].copy_(
+                self._v_buffer[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens]
+            )
+            if self.config.use_quantization and self._k_scale is not None:
+                self._k_scale[:, sink_tokens:sink_tokens + num_rolled_tokens].copy_(
+                    self._k_scale[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens]
+                )
+                self._v_scale[:, sink_tokens:sink_tokens + num_rolled_tokens].copy_(
+                    self._v_scale[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens]
+                )
+
+        # Write new KV (with quantization if enabled)
+        if self.config.use_quantization:
+            new_k_q, new_k_scale = self._quantize_int8(new_k)
+            new_v_q, new_v_scale = self._quantize_int8(new_v)
+            self._k_buffer[:, write_start_index:write_end_index].copy_(new_k_q)
+            self._v_buffer[:, write_start_index:write_end_index].copy_(new_v_q)
+            self._k_scale[:, write_start_index:write_end_index].copy_(new_k_scale)
+            self._v_scale[:, write_start_index:write_end_index].copy_(new_v_scale)
+        else:
+            self._k_buffer[:, write_start_index:write_end_index].copy_(new_k)
+            self._v_buffer[:, write_start_index:write_end_index].copy_(new_v)
+
+        # Update indices
+        self._global_end = global_end
+        self._local_end = local_end
+        self._valid_len = local_end
+
+        # Update dict values for next access
         self._update_dict_values()
 
     def reset(self):

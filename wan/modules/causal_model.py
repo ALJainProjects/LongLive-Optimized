@@ -837,6 +837,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
     def _apply_cache_updates(self, kv_cache, cache_update_infos):
         """
         Applies cache updates collected from multiple blocks.
+
+        If the cache layer is an IntegratedKVCacheLayer, uses its optimized
+        update_from_attention() method which supports ring buffer and INT8 quantization.
+        Otherwise falls back to direct tensor manipulation.
+
         Args:
             kv_cache: List of cache dictionaries for each block
             cache_update_infos: List of (block_index, cache_update_info) tuples
@@ -844,7 +849,33 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         for block_index, (current_end, local_end_index, update_info) in cache_update_infos:
             if update_info is not None:
                 cache = kv_cache[block_index]
-                
+
+                # Check if cache layer has optimized update method (IntegratedKVCacheLayer)
+                if hasattr(cache, 'update_from_attention'):
+                    # Use optimized ring buffer / INT8 update
+                    write_start_index = update_info.get("write_start_index", update_info.get("local_start_index", 0))
+                    write_end_index = update_info.get("write_end_index", update_info.get("local_end_index", 0))
+                    new_k = update_info.get("new_k")
+                    new_v = update_info.get("new_v")
+
+                    if new_k is not None and new_v is not None:
+                        cache.update_from_attention(
+                            new_k=new_k,
+                            new_v=new_v,
+                            write_start_index=write_start_index,
+                            write_end_index=write_end_index,
+                            global_end=current_end,
+                            local_end=local_end_index,
+                            do_roll=(update_info["action"] == "roll_and_insert"),
+                            sink_tokens=update_info.get("sink_tokens", 0),
+                            num_rolled_tokens=update_info.get("num_rolled_tokens", 0),
+                            num_evicted_tokens=update_info.get("num_evicted_tokens", 0),
+                        )
+
+                    # Skip the index update below - update_from_attention handles it
+                    continue
+
+                # Fall back to original direct tensor manipulation
                 if update_info["action"] == "roll_and_insert":
                     # Apply rolling update
                     sink_tokens = update_info["sink_tokens"]
@@ -856,18 +887,18 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     write_end_index = update_info.get("write_end_index", local_end_index)
                     new_k = update_info["new_k"]
                     new_v = update_info["new_v"]
-                    
+
                     # Perform the rolling operation
                     cache["k"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                         cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                     cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                         cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                    
+
                     # Insert new key/value
                     if write_end_index > write_start_index and new_k.shape[1] == (write_end_index - write_start_index):
                         cache["k"][:, write_start_index:write_end_index] = new_k
                         cache["v"][:, write_start_index:write_end_index] = new_v
-                    
+
                 elif update_info["action"] == "direct_insert":
                     # Direct insert
                     local_start_index = update_info["local_start_index"]
@@ -876,12 +907,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     write_end_index = update_info.get("write_end_index", local_end_index)
                     new_k = update_info["new_k"]
                     new_v = update_info["new_v"]
-                    
+
                     # Insert new key/value
                     if write_end_index > write_start_index and new_k.shape[1] == (write_end_index - write_start_index):
                         cache["k"][:, write_start_index:write_end_index] = new_k
                         cache["v"][:, write_start_index:write_end_index] = new_v
-            
+
             # Update indices: do not roll back pointers during recomputation
             is_recompute = False if update_info is None else update_info.get("is_recompute", False)
             if not is_recompute:

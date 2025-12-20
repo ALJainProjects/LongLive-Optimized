@@ -39,6 +39,7 @@ class OptimizationConfig:
     # === KV Cache ===
     use_static_kv: bool = True
     use_quantized_kv: bool = False
+    use_integrated_kv_cache: bool = False  # Use ring buffer + optional INT8
     kv_quantization: str = "int8"  # "int8" or "fp8"
     local_attn_size: int = 12  # Match LongLive default (frames)
     sink_size: int = 3  # Frame sink size (first N frames as anchors)
@@ -125,6 +126,7 @@ class OptimizationConfig:
             'cuda_graph_pool_size': self.cuda_graph_pool_size,
             'use_static_kv': self.use_static_kv,
             'use_quantized_kv': self.use_quantized_kv,
+            'use_integrated_kv_cache': self.use_integrated_kv_cache,
             'kv_quantization': self.kv_quantization,
             'local_attn_size': self.local_attn_size,
             'sink_size': self.sink_size,
@@ -231,6 +233,7 @@ class OptimizationConfig:
             use_cuda_graphs=False,  # torch.compile is more robust
             use_static_kv=False,  # Quantized KV takes precedence
             use_quantized_kv=True,
+            use_integrated_kv_cache=True,  # Ring buffer + INT8 quantization
             kv_quantization="int8",
             use_async_vae=True,
             use_prompt_cache=True,

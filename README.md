@@ -48,18 +48,19 @@ We implement inference-time optimizations to reduce latency as much as possible:
 | Memory Pool | Pre-allocated tensor reuse | ~2% | ✅ Working |
 | Async VAE | Overlap decode with next block | ~2% | ✅ Working |
 | Static KV (buffer reuse) | Reuse KV tensors | ~2% | ✅ Working |
-| Static KV (ring buffer) | O(1) cache updates | 0% | ⚠️ Implemented, not integrated |
-| Quantized KV | INT8 cache compression | 0% | ⚠️ Implemented, not integrated |
+| Ring Buffer KV | O(1) cache updates | Pending test | ✅ Integrated |
+| INT8 Quantized KV | INT8 cache compression | Pending test | ✅ Integrated |
+| Flash Attention Fallback | PyTorch SDPA when FA unavailable | N/A | ✅ Working |
 | CUDA Graphs | Capture/replay | 0% | ❌ Incompatible with PEFT/LoRA |
 
 ### Key Results (Actual Measurements on H100)
 
 | Preset | Mean Latency | Max Latency | FPS | Memory | vs Baseline |
 |--------|-------------|-------------|-----|--------|-------------|
-| **Baseline** | 772ms | 787ms | 3.9 | 21.4 GB | - |
-| **Quality** | 742ms | 757ms | 4.0 | 21.6 GB | -3.9% |
-| **Balanced** | 594ms | 602ms | 5.1 | 21.7 GB | **-23.1%** |
-| **Speed** | 599ms | 609ms | 5.0 | 24.4 GB | -22.4% |
+| **Baseline** | 752ms | 752ms | 4.1 | 35.6 GB | - |
+| **Balanced** | 579ms | 590ms | 5.2 | 39.1 GB | **-21.5%** |
+
+*Latest benchmark run (2024-12-20). Prompt-switch latency: Baseline 736ms → Optimized 598ms (-18.7%).*
 
 **Primary finding**: `torch.compile` provides the only significant improvement (~23%). Other optimizations provide marginal gains.
 
@@ -595,6 +596,7 @@ LongLive-Optimized/
 │   ├── config.py                     # OptimizationConfig dataclass
 │   ├── cuda_graphs.py                # CUDAGraphWrapper, MultiStepWrapper
 │   ├── static_kv_cache.py            # Ring buffer KV cache
+│   ├── integrated_kv_cache.py        # IntegratedKVCache (ring buffer + INT8)
 │   ├── quantized_kv.py               # INT8/FP8 KV cache
 │   ├── prompt_cache.py               # LRU prompt embedding cache
 │   ├── async_vae.py                  # Double-buffered async VAE
@@ -709,10 +711,11 @@ This is the detailed log of optimizations tested, with actual measured results.
 1. **torch.compile is the only significant optimization** - provides 23% latency reduction
 2. **Other optimizations are marginal** - prompt cache, memory pool, async VAE combined give ~4%
 3. **CUDA Graphs incompatible** - PEFT/LoRA hooks and dynamic KV indices break graph capture
-4. **Quantized KV not integrated** - allocates buffers but attention still uses FP16/BF16
+4. **Ring buffer + INT8 KV now integrated** - `_apply_cache_updates` uses `update_from_attention()` when available
 5. **Window size has negligible latency impact** - all sizes within measurement noise (~1%)
 6. **Sync elimination provides minimal benefit** - only 0.2% improvement
 7. **FP16 incompatible with current model** - BF16 biases require BF16 inputs
+8. **Flash attention fallback added** - Falls back to PyTorch SDPA when flash_attn unavailable
 
 ---
 
