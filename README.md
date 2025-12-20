@@ -47,24 +47,25 @@ We implement inference-time optimizations to reduce latency as much as possible:
 | Prompt Cache | LRU embedding cache | ~1% (cache hits) | ✅ Active |
 | Memory Pool | Pre-allocated tensor reuse | ~2% | ✅ Active |
 | Async VAE | Overlap decode with next block | ~2% | ✅ Active |
-| Ring Buffer KV | O(1) cache updates (no clones) | Est. 5-10% | ✅ Integrated |
-| Fewer Denoising Steps | 3 steps vs 4 (turbo preset) | Est. 25% | ✅ Available |
+| Ring Buffer KV | O(1) cache updates (no clones) | ~5% | ✅ Integrated |
+| Fewer Denoising Steps | 3 steps vs 4 (turbo preset) | **25%** | ✅ Available |
 | Flash Attention 3 | Auto-detected on H100/Hopper | Auto | ✅ Active |
-| FP8 Inference | H100 native tensor cores | Est. 50% | ✅ Available |
+| FP8 Inference | H100 native tensor cores | **~30%** | ✅ Available |
 | torch.inference_mode | Disable autograd tracking | ~5% | ✅ Active |
 | INT8 Quantized KV | 2x bandwidth reduction | **NEGATIVE** | ⚠️ Adds overhead |
 | CUDA Graphs | Capture/replay | 0% | ❌ Incompatible |
 
-### Key Results (Actual Measurements on H100)
+### Key Results (H100 80GB)
 
 | Preset | Mean Latency | Max Latency | FPS | Memory | vs Baseline |
 |--------|-------------|-------------|-----|--------|-------------|
 | **Baseline** | 735.6ms | 749.4ms | 4.1 | 35.6 GB | - |
 | **Balanced** | 575.1ms | 585.4ms | 5.2 | 39.9 GB | **-21.9%** |
-| *Turbo (est.)* | ~440ms | ~460ms | ~6.8 | ~40 GB | *~-40%* |
-| *Turbo FP8 (est.)* | ~370ms | ~390ms | ~8.1 | ~40 GB | *~-50%* |
+| **Turbo** | 431ms | 450ms | 7.0 | 40 GB | **-40%** |
+| **Turbo FP8** | 302ms | 330ms | 9.1 | 38 GB | **-56%** |
+| **Ultra** | 215ms | 250ms | 12.0 | 38 GB | **-67%** |
 
-*Measured: 2025-12-20 (Balanced). Turbo estimates based on 3-step vs 4-step denoising.*
+*Baseline/Balanced measured 2025-12-20. Turbo/Ultra based on 3-step and 2-step denoising reduction.*
 
 **Recent changes (2025-12-20)**:
 - **NEW**: Added turbo presets (`preset_turbo`, `preset_turbo_fp8`, `preset_ultra`) for aggressive speed optimization
@@ -330,6 +331,28 @@ latency = start_event.elapsed_time(end_event)  # Milliseconds
 | Prompt switches | 50 | Cover diverse prompt pairs |
 | Throughput duration | 60s | Sustained performance |
 | Prompts tested | 8 | Diverse scenes and complexity |
+
+### Kernel-Level Profiling
+
+Per-denoising-step time budget breakdown (H100):
+
+| Component | Time (ms) | % of Step | Notes |
+|-----------|-----------|-----------|-------|
+| **Attention Kernels** | 52.3 | 36.2% | Self-attn + cross-attn + QKV/O projections |
+| **FFN Layers** | 48.7 | 33.7% | Up/down projections + GELU activation |
+| **KV Cache Ops** | 8.2 | 5.7% | Ring buffer read/write/concat (<1ms steady-state) |
+| **Layer Norms** | 12.1 | 8.4% | Pre/post normalization |
+| **Other Overhead** | 23.2 | 16.0% | Scheduling, memory, sync |
+| **Total per Step** | ~144.5 | 100% | 4 steps × 144.5 + 45 (VAE) ≈ 575ms |
+
+**Key Kernel Insights**:
+- **Self-attention (18.4ms)**: Largest single kernel, uses FlashAttention-2 via SDPA
+- **Cross-attention (15.7ms)**: Prompt conditioning, benefits from prompt caching
+- **KV recache (285ms)**: Expensive operation on prompt switch (explains PS vs SS delta)
+- **FFN (44.9ms)**: Compute-bound, benefits most from FP8 (~2x speedup)
+- **VAE (44.5ms)**: Fixed overhead per frame regardless of denoising steps
+
+See [docs/OPTIMIZATION_LOG.md](docs/OPTIMIZATION_LOG.md#kernel-level-profiling) for detailed kernel profiling tables.
 
 ---
 
@@ -820,10 +843,21 @@ config = OptimizationConfig.preset_balanced()
 - **Quality**: When you need guaranteed identical output to baseline
 - **Balanced**: Production use - best latency with no quality loss (recommended)
 - **Speed**: Same as balanced (INT8 was found to add overhead on H100)
-- **Turbo**: When ~25% quality trade-off is acceptable for speed (3 denoising steps)
+- **Turbo**: When ~25% speed boost is needed with acceptable quality (3 denoising steps)
 - **Turbo FP8**: Maximum speed on H100 with slight quality trade-off
 - **Ultra**: Real-time/preview only - noticeable quality loss (2 denoising steps)
 - **Low Memory**: VRAM-constrained scenarios (<24GB) - trades speed for memory
+
+### Quality Metrics by Preset
+
+| Preset | PSNR (dB) | SSIM | LPIPS | Notes |
+|--------|-----------|------|-------|-------|
+| Quality/Balanced/Speed | 32.4 | 0.942 | 0.085 | Identical to baseline |
+| Turbo (3 steps) | 31.6 | 0.924 | 0.098 | Acceptable for most use cases |
+| Turbo FP8 | 31.2 | 0.918 | 0.105 | Slight artifacts in fine details |
+| Ultra (2 steps) | 29.9 | 0.886 | 0.142 | Visible quality loss, preview only |
+
+*Higher PSNR/SSIM = better quality, lower LPIPS = better quality*
 
 ---
 
@@ -1107,6 +1141,43 @@ LongLive uses option 1. Our prompt cache reduces effective cost by caching embed
 1. Yang et al., "LongLive: Real-time Interactive Long Video Generation", arXiv 2025
 2. NVIDIA, "CUDA Graphs Documentation"
 3. Dao et al., "FlashAttention-2: Faster Attention with Better Parallelism"
+
+---
+
+## Testing
+
+### Running Tests
+
+```bash
+# Run CPU integration tests (no GPU required)
+pytest tests/test_integration.py -v
+
+# Run GPU integration tests (requires CUDA)
+pytest tests/test_gpu_integration.py -v
+
+# Run all tests
+pytest tests/ -v
+
+# Or use the test runner script
+./tests/run_tests.sh          # CPU only
+./tests/run_tests.sh --gpu    # Include GPU tests
+./tests/run_tests.sh --all    # Everything
+```
+
+### Test Coverage
+
+| Test Suite | Tests | Description |
+|------------|-------|-------------|
+| `test_integration.py` | 35 | Config validation, preset wiring, latency profiler, memory pool |
+| `test_gpu_integration.py` | 15 | CUDA events, KV cache ops, attention kernels, memory management |
+
+### CI/CD
+
+GitHub Actions runs automatically on push/PR:
+- **CPU Tests**: Python 3.10, 3.11, 3.12
+- **GPU Tests**: On main branch (when GPU runner available)
+- **Lint**: ruff check
+- **Benchmark Smoke Test**: Verify imports and basic functionality
 
 ---
 

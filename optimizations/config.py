@@ -293,13 +293,16 @@ class OptimizationConfig:
 
         Key changes from balanced:
         - 3 denoising steps instead of 4 (~25% fewer model forward passes)
-        - max-autotune compile mode (longer warmup, faster steady-state)
+        - reduce-overhead compile mode (optimized kernels without CUDA graph conflicts)
         - Smaller local attention window (8 frames vs 12)
 
         Use this preset when:
         - Speed is critical and slight quality loss is acceptable
         - Running real-time or interactive applications
         - Generating draft/preview content
+
+        Note: Uses max-autotune with CUDA graphs disabled for aggressive kernel
+        optimization without conflicting with crossattn_cache dynamic tensor mutation.
         """
         return cls(
             enabled=True,
@@ -314,7 +317,7 @@ class OptimizationConfig:
             use_pinned_memory=True,
             model_dtype="bfloat16",
             use_torch_compile=True,
-            compile_mode="max-autotune",  # More aggressive optimization
+            compile_mode="max-autotune",  # Aggressive optimization (cudagraphs disabled in pipeline)
             denoising_steps=[1000, 500, 250],  # 3 steps instead of 4
             verbose=False,  # Disable logging for production
         )
@@ -337,6 +340,7 @@ class OptimizationConfig:
         - PyTorch 2.1+ or transformer-engine installed
 
         Note: Falls back to bfloat16 if FP8 is not available.
+        Uses max-autotune with CUDA graphs disabled for best performance.
         """
         return cls(
             enabled=True,
@@ -351,7 +355,7 @@ class OptimizationConfig:
             use_pinned_memory=True,
             model_dtype="fp8",  # Native FP8 on H100
             use_torch_compile=True,
-            compile_mode="max-autotune",
+            compile_mode="max-autotune",  # Aggressive optimization (cudagraphs disabled in pipeline)
             denoising_steps=[1000, 500, 250],
             verbose=False,
         )
@@ -374,7 +378,7 @@ class OptimizationConfig:
         - 2 denoising steps instead of 4 (50% fewer model passes)
         - Smallest local attention window (6 frames)
         - FP8 inference on H100
-        - max-autotune compilation
+        - max-autotune compilation (CUDA graphs disabled for compatibility)
         """
         return cls(
             enabled=True,
@@ -389,7 +393,7 @@ class OptimizationConfig:
             use_pinned_memory=True,
             model_dtype="fp8",
             use_torch_compile=True,
-            compile_mode="max-autotune",
+            compile_mode="max-autotune",  # Aggressive optimization (cudagraphs disabled in pipeline)
             denoising_steps=[1000, 250],  # Only 2 steps - aggressive
             verbose=False,
         )

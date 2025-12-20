@@ -379,6 +379,10 @@ def load_pipeline(config_path: str, optimized: bool = False, preset: str = "bala
             'quality': OptimizationConfig.preset_quality,
             'balanced': OptimizationConfig.preset_balanced,
             'speed': OptimizationConfig.preset_speed,
+            'turbo': OptimizationConfig.preset_turbo,
+            'turbo_fp8': OptimizationConfig.preset_turbo_fp8,
+            'ultra': OptimizationConfig.preset_ultra,
+            'low_memory': OptimizationConfig.preset_low_memory,
         }
         opt_config = presets[preset]()
 
@@ -393,7 +397,8 @@ def main():
     parser.add_argument('--config', type=str, required=True, help='LongLive inference config')
     parser.add_argument('--optimized', action='store_true', help='Use optimized pipeline')
     parser.add_argument('--compare', action='store_true', help='Compare baseline vs optimized')
-    parser.add_argument('--preset', type=str, default='balanced', choices=['quality', 'balanced', 'speed'])
+    parser.add_argument('--preset', type=str, default='balanced',
+                        choices=['quality', 'balanced', 'speed', 'turbo', 'turbo_fp8', 'ultra', 'low_memory'])
     parser.add_argument('--quick', action='store_true', help='Quick mode (fewer samples)')
     parser.add_argument('--output', type=str, default='results', help='Output directory')
 

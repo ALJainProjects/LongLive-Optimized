@@ -65,13 +65,18 @@ class ScopeOptimizationConfig(OptimizationConfig):
     def preset_realtime(cls) -> 'ScopeOptimizationConfig':
         """Preset optimized for real-time streaming with minimal latency."""
         return cls(
-            use_cuda_graphs=True,
+            use_cuda_graphs=False,  # CUDA graphs incompatible with LongLive dynamic KV
+            use_torch_compile=True,
+            compile_mode="max-autotune",
             use_static_kv=True,
             use_quantized_kv=False,
+            use_integrated_kv_cache=True,
             use_async_vae=True,
             use_prompt_cache=True,
             use_memory_pool=True,
             model_dtype="bfloat16",
+            denoising_steps=[1000, 500, 250],  # 3 steps for speed
+            local_attn_size=8,  # Smaller window
             enable_latency_overlay=True,
             target_fps=25,
             drop_frames_on_lag=True,
@@ -82,8 +87,11 @@ class ScopeOptimizationConfig(OptimizationConfig):
         """Preset for higher quality streaming (slightly more latency)."""
         return cls(
             use_cuda_graphs=False,
+            use_torch_compile=True,
+            compile_mode="default",
             use_static_kv=True,
             use_quantized_kv=False,
+            use_integrated_kv_cache=True,
             use_async_vae=True,
             use_prompt_cache=True,
             use_memory_pool=True,
@@ -91,6 +99,48 @@ class ScopeOptimizationConfig(OptimizationConfig):
             enable_latency_overlay=True,
             target_fps=20,
             drop_frames_on_lag=False,
+        )
+
+    @classmethod
+    def preset_turbo(cls) -> 'ScopeOptimizationConfig':
+        """Maximum speed with slight quality trade-off (3 denoising steps)."""
+        return cls(
+            use_cuda_graphs=False,
+            use_torch_compile=True,
+            compile_mode="max-autotune",
+            use_static_kv=True,
+            use_quantized_kv=False,
+            use_integrated_kv_cache=True,
+            use_async_vae=True,
+            use_prompt_cache=True,
+            use_memory_pool=True,
+            model_dtype="bfloat16",
+            denoising_steps=[1000, 500, 250],  # 3 steps
+            local_attn_size=8,
+            enable_latency_overlay=True,
+            target_fps=30,
+            drop_frames_on_lag=True,
+        )
+
+    @classmethod
+    def preset_ultra(cls) -> 'ScopeOptimizationConfig':
+        """Preview/draft mode with maximum speed (2 denoising steps, noticeable quality loss)."""
+        return cls(
+            use_cuda_graphs=False,
+            use_torch_compile=True,
+            compile_mode="max-autotune",
+            use_static_kv=True,
+            use_quantized_kv=False,
+            use_integrated_kv_cache=True,
+            use_async_vae=True,
+            use_prompt_cache=True,
+            use_memory_pool=True,
+            model_dtype="fp8",  # FP8 for maximum speed on H100
+            denoising_steps=[1000, 250],  # 2 steps only
+            local_attn_size=6,
+            enable_latency_overlay=True,
+            target_fps=40,
+            drop_frames_on_lag=True,
         )
 
 
@@ -609,13 +659,15 @@ class OptimizedScopePipeline:
         Switch optimization preset at runtime.
 
         Args:
-            preset: One of "realtime", "quality", "balanced", "speed"
+            preset: One of "realtime", "quality", "balanced", "speed", "turbo", "ultra"
         """
         presets = {
             "realtime": ScopeOptimizationConfig.preset_realtime,
             "quality": ScopeOptimizationConfig.preset_quality_stream,
             "balanced": ScopeOptimizationConfig.preset_balanced,
             "speed": ScopeOptimizationConfig.preset_speed,
+            "turbo": ScopeOptimizationConfig.preset_turbo,
+            "ultra": ScopeOptimizationConfig.preset_ultra,
         }
 
         if preset not in presets:
@@ -659,6 +711,8 @@ def create_optimized_scope_pipeline(
         "quality": ScopeOptimizationConfig.preset_quality_stream,
         "balanced": ScopeOptimizationConfig.preset_balanced,
         "speed": ScopeOptimizationConfig.preset_speed,
+        "turbo": ScopeOptimizationConfig.preset_turbo,
+        "ultra": ScopeOptimizationConfig.preset_ultra,
     }
 
     config_class = presets.get(preset, ScopeOptimizationConfig.preset_realtime)

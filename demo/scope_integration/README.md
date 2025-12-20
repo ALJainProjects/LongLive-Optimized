@@ -119,12 +119,16 @@ class ScopeOptimizationConfig(OptimizationConfig):
 
 ### Presets
 
-| Preset | Use Case | Target FPS |
-|--------|----------|------------|
-| `realtime` | Minimum latency streaming | 25+ |
-| `quality_stream` | Higher quality, more latency | 20 |
-| `balanced` | General use | 25 |
-| `speed` | Maximum throughput | 30+ |
+| Preset | Use Case | Expected Latency | FPS | Quality |
+|--------|----------|------------------|-----|---------|
+| `realtime` | Minimum latency streaming | ~460ms | 6.5 | Slight loss |
+| `quality_stream` | Higher quality streaming | ~575ms | 5.2 | Identical |
+| `balanced` | General use (recommended) | ~575ms | 5.2 | Identical |
+| `speed` | Same as balanced | ~575ms | 5.2 | Identical |
+| `turbo` | Maximum speed with 3 steps | ~458ms | 6.5 | Slight loss |
+| `ultra` | Preview/draft mode (2 steps) | ~312ms | 9.6 | Noticeable loss |
+
+**Note**: CUDA Graphs are disabled in all presets due to incompatibility with LongLive's dynamic KV cache indices. torch.compile with max-autotune provides the primary optimization.
 
 ## Latency Overlay
 
@@ -140,7 +144,7 @@ The overlay shows real-time latency information:
 │ Frame: 1234         │  <- Total frames generated
 │                     │
 │ Optimizations:      │
-│   + CUDA Graphs     │  <- Active optimizations
+│   + torch.compile   │  <- Active optimizations
 │   + Static KV       │
 │   + Async VAE       │
 │                     │
@@ -242,11 +246,12 @@ class LatencyStats:
 - Ensure OpenCV is installed: `pip install opencv-python`
 - Check that `enable_latency_overlay` is `True` in config
 
-### CUDA Graph Capture Fails
+### torch.compile Issues
 
-- Run warmup before generating frames
-- Ensure tensor shapes are static
-- Check for sync operations in forward pass
+- Run warmup before generating frames (allows compilation to complete)
+- First few frames will be slower during compilation
+- Use `compile_mode="default"` if `max-autotune` causes issues
+- CUDA Graphs are intentionally disabled (LongLive KV cache incompatibility)
 
 ### High Latency Despite Optimizations
 

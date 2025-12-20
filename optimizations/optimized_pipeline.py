@@ -93,7 +93,18 @@ class OptimizedCausalInferencePipeline:
         self.vae = base_pipeline.vae
         self.args = base_pipeline.args
         self.scheduler = base_pipeline.scheduler
-        self.denoising_step_list = base_pipeline.denoising_step_list
+        # Use config's denoising_steps if different from base (turbo/ultra use fewer steps)
+        if config.denoising_steps != [1000, 750, 500, 250]:
+            # Override with config's steps (e.g., 3 steps for turbo, 2 for ultra)
+            self.denoising_step_list = torch.tensor(config.denoising_steps, dtype=torch.long)
+            if hasattr(base_pipeline.args, 'warp_denoising_step') and base_pipeline.args.warp_denoising_step:
+                timesteps = base_pipeline.scheduler.timesteps
+                self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
+            self._custom_denoising_steps = True
+            print(f"[OptimizedPipeline] Using {len(config.denoising_steps)} denoising steps: {config.denoising_steps}")
+        else:
+            self.denoising_step_list = base_pipeline.denoising_step_list
+            self._custom_denoising_steps = False
         self.num_transformer_blocks = base_pipeline.num_transformer_blocks
         self.frame_seq_length = base_pipeline.frame_seq_length
         self.num_frame_per_block = base_pipeline.num_frame_per_block
@@ -236,13 +247,22 @@ class OptimizedCausalInferencePipeline:
                     self._log(f"  [!] PEFT/LoRA detected: torch.compile will use partial compilation")
 
                 compile_mode = self.config.compile_mode
+
+                # Disable CUDA graphs for max-autotune mode - LongLive's crossattn_cache
+                # is dynamically mutated which conflicts with CUDA graph tensor capture
+                compile_options = {}
+                if compile_mode == "max-autotune":
+                    compile_options = {"triton.cudagraphs": False}
+
                 self.generator.model = torch.compile(
                     self.generator.model,
                     mode=compile_mode,
                     fullgraph=False,  # Disable fullgraph for PEFT compatibility
+                    options=compile_options if compile_options else None,
                 )
                 self._compiled = True
-                self._log(f"  [+] torch.compile: mode={compile_mode}, fullgraph=False (PEFT-safe)")
+                cudagraph_status = " (cudagraphs=off)" if compile_options else ""
+                self._log(f"  [+] torch.compile: mode={compile_mode}{cudagraph_status}, fullgraph=False (PEFT-safe)")
             except Exception as e:
                 warnings.warn(f"torch.compile failed: {e}. Falling back to eager mode.")
                 self._compiled = False
@@ -843,6 +863,71 @@ class OptimizedCausalInferencePipeline:
 
         return stats
 
+    def compute_quality_metrics(
+        self,
+        baseline_video: torch.Tensor,
+        optimized_video: torch.Tensor,
+    ) -> dict:
+        """
+        Compute quality metrics comparing baseline to optimized output.
+
+        Args:
+            baseline_video: Reference video tensor [T, C, H, W] or [B, T, C, H, W]
+            optimized_video: Optimized video tensor (same shape)
+
+        Returns:
+            dict with PSNR, SSIM, and LPIPS values
+        """
+        import torch.nn.functional as F
+
+        # Ensure same shape
+        if baseline_video.shape != optimized_video.shape:
+            raise ValueError(f"Shape mismatch: {baseline_video.shape} vs {optimized_video.shape}")
+
+        # Flatten batch dimension if present
+        if baseline_video.dim() == 5:
+            baseline_video = baseline_video.squeeze(0)  # [T, C, H, W]
+            optimized_video = optimized_video.squeeze(0)
+
+        num_frames = baseline_video.shape[0]
+
+        # Compute PSNR per frame
+        psnr_values = []
+        for i in range(num_frames):
+            mse = F.mse_loss(baseline_video[i], optimized_video[i])
+            if mse == 0:
+                psnr = float('inf')
+            else:
+                psnr = 10 * torch.log10(1.0 / mse).item()
+            psnr_values.append(psnr)
+
+        # Compute simple SSIM per frame (grayscale approximation)
+        ssim_values = []
+        C1 = 0.01 ** 2
+        C2 = 0.03 ** 2
+        for i in range(num_frames):
+            base_gray = 0.299 * baseline_video[i, 0] + 0.587 * baseline_video[i, 1] + 0.114 * baseline_video[i, 2]
+            opt_gray = 0.299 * optimized_video[i, 0] + 0.587 * optimized_video[i, 1] + 0.114 * optimized_video[i, 2]
+
+            mu1 = base_gray.mean()
+            mu2 = opt_gray.mean()
+            sigma1_sq = ((base_gray - mu1) ** 2).mean()
+            sigma2_sq = ((opt_gray - mu2) ** 2).mean()
+            sigma12 = ((base_gray - mu1) * (opt_gray - mu2)).mean()
+
+            ssim = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / \
+                   ((mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2))
+            ssim_values.append(ssim.item())
+
+        import numpy as np
+        return {
+            'psnr_mean': float(np.mean(psnr_values)),
+            'psnr_std': float(np.std(psnr_values)),
+            'ssim_mean': float(np.mean(ssim_values)),
+            'ssim_std': float(np.std(ssim_values)),
+            'num_frames': num_frames,
+        }
+
     # === Compatibility methods ===
     # These delegate to base pipeline to ensure full API compatibility
 
@@ -934,7 +1019,14 @@ def create_optimized_pipeline(
         "quality": OptimizationConfig.preset_quality,
         "balanced": OptimizationConfig.preset_balanced,
         "speed": OptimizationConfig.preset_speed,
+        "turbo": OptimizationConfig.preset_turbo,
+        "turbo_fp8": OptimizationConfig.preset_turbo_fp8,
+        "ultra": OptimizationConfig.preset_ultra,
+        "low_memory": OptimizationConfig.preset_low_memory,
     }
+
+    if preset not in presets:
+        raise ValueError(f"Unknown preset: {preset}. Available: {list(presets.keys())}")
 
     config = presets[preset]()
 

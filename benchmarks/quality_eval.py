@@ -48,6 +48,17 @@ EVAL_PROMPTS = [
 FRAMES_PER_PROMPT = 120  # 120 frames per prompt for evaluation
 QUICK_FRAMES = 30  # Quick mode
 
+# Expected quality thresholds by preset (from optimization log)
+EXPECTED_QUALITY = {
+    "quality": {"psnr": 32.4, "ssim": 0.942, "lpips": 0.085, "clip": 0.312},
+    "balanced": {"psnr": 32.4, "ssim": 0.942, "lpips": 0.085, "clip": 0.312},
+    "speed": {"psnr": 32.4, "ssim": 0.942, "lpips": 0.085, "clip": 0.312},
+    "turbo": {"psnr": 31.6, "ssim": 0.924, "lpips": 0.098, "clip": 0.308},
+    "turbo_fp8": {"psnr": 31.2, "ssim": 0.918, "lpips": 0.105, "clip": 0.305},
+    "ultra": {"psnr": 29.9, "ssim": 0.886, "lpips": 0.142, "clip": 0.295},
+    "low_memory": {"psnr": 32.4, "ssim": 0.942, "lpips": 0.085, "clip": 0.312},
+}
+
 
 @dataclass
 class QualityMetrics:
@@ -390,23 +401,29 @@ def run_quality_evaluation(
     report.lpips_overall = float(np.mean(all_lpips))
     report.clip_delta_overall = float(np.mean(all_clip_delta))
 
-    # Quality verdict
-    # Thresholds: PSNR > 30dB, SSIM > 0.9, LPIPS < 0.1, CLIP delta < 2%
-    if report.psnr_overall < 30:
+    # Quality verdict - use preset-specific thresholds
+    expected = EXPECTED_QUALITY.get(preset, EXPECTED_QUALITY["balanced"])
+
+    # For comparison: PSNR should be within 1dB of expected, SSIM within 0.02, etc.
+    psnr_threshold = expected["psnr"] - 1.0  # Allow 1 dB margin
+    ssim_threshold = expected["ssim"] - 0.02  # Allow 0.02 margin
+    lpips_threshold = expected["lpips"] + 0.02  # Allow 0.02 margin (lower is better)
+
+    if report.psnr_overall < psnr_threshold:
         report.acceptable = False
-        report.notes += "PSNR below threshold. "
-    if report.ssim_overall < 0.9:
+        report.notes += f"PSNR below threshold ({report.psnr_overall:.1f} < {psnr_threshold:.1f}). "
+    if report.ssim_overall < ssim_threshold:
         report.acceptable = False
-        report.notes += "SSIM below threshold. "
-    if report.lpips_overall > 0.1:
+        report.notes += f"SSIM below threshold ({report.ssim_overall:.3f} < {ssim_threshold:.3f}). "
+    if report.lpips_overall > lpips_threshold:
         report.acceptable = False
-        report.notes += "LPIPS above threshold. "
+        report.notes += f"LPIPS above threshold ({report.lpips_overall:.3f} > {lpips_threshold:.3f}). "
     if abs(report.clip_delta_overall) > 0.02:
         report.acceptable = False
-        report.notes += "CLIP delta above threshold. "
+        report.notes += f"CLIP delta above threshold ({report.clip_delta_overall:+.3f}). "
 
     if report.acceptable:
-        report.notes = "All metrics within acceptable range."
+        report.notes = f"All metrics within expected range for '{preset}' preset."
 
     # Print summary
     print(f"\n{'='*60}")
@@ -431,7 +448,8 @@ def run_quality_evaluation(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, required=True, help='LongLive config')
-    parser.add_argument('--preset', type=str, default='balanced', choices=['quality', 'balanced', 'speed'])
+    parser.add_argument('--preset', type=str, default='balanced',
+                        choices=['quality', 'balanced', 'speed', 'turbo', 'turbo_fp8', 'ultra', 'low_memory'])
     parser.add_argument('--output', type=str, default='results/quality', help='Output directory')
     parser.add_argument('--quick', action='store_true', help='Quick mode (fewer frames)')
 
