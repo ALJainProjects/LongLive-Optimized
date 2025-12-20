@@ -60,9 +60,9 @@ We implement inference-time optimizations to reduce latency as much as possible:
 | **Baseline** | 735.6ms | 749.4ms | 4.1 | 35.6 GB | - |
 | **Balanced** | 575.1ms | 585.4ms | 5.2 | 39.9 GB | **-21.9%** |
 
-*Last benchmark: 2024-12-20 with integrated KV cache (ring buffer + full pre-allocated buffers).*
+*Last benchmark: 2025-12-20 with integrated KV cache (ring buffer + full pre-allocated buffers).*
 
-**Recent changes (2024-12-20)**:
+**Recent changes (2025-12-20)**:
 - Ring buffer KV now **FULLY INTEGRATED** into `_apply_cache_updates()` via `update_from_attention()`
 - INT8 quantization **FULLY INTEGRATED** with lazy dequantization (`LazyTensor`)
 - Fixed LazyTensor shape mismatch - now returns full pre-allocated buffers
