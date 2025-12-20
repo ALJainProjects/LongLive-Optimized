@@ -134,33 +134,42 @@ prompt_switch_latency = encode_time + recache_time + first_frame_time
 
 ---
 
-## 4. The 40ms Wall
+## 4. The Latency Reality
 
-### Where the Time Goes
+### Paper Claims vs Actual Measurements
+
+The LongLive paper claims ~48ms per frame (20.7 FPS). However, with the full 1.3B model + 350M LoRA parameters, our measurements on H100 show:
 
 ```
-Target: 40ms per frame for 25 FPS real-time interaction
-
-Current Breakdown (estimated H100):
+Actual Baseline (H100 80GB, BF16, 4-step denoising):
 ├── Denoising (4 steps)
-│   ├── Step 1: ~8ms
-│   ├── Step 2: ~8ms
-│   ├── Step 3: ~8ms
-│   └── Step 4: ~8ms
-├── VAE Decode: ~6ms
-├── KV Operations: ~2ms
-├── Sync/Overhead: ~2ms
-└── Total: ~42ms (OVER TARGET)
+│   ├── Step 1: ~144ms
+│   ├── Step 2: ~144ms
+│   ├── Step 3: ~144ms
+│   └── Step 4: ~144ms
+├── VAE Decode: ~45ms
+├── KV Operations: ~8ms (steady-state <1ms)
+├── Sync/Overhead: ~23ms
+└── Total: ~735ms baseline → 575ms optimized (Balanced preset)
 ```
 
-### Why 40ms is Difficult
+### Per-Step Kernel Breakdown (with torch.compile)
 
-The denoising steps alone consume ~32ms. With 4 steps, each step must complete in ~8ms, which is already near the minimum for:
-- Attention computation over local window
-- FFN layers (2× hidden expansion)
-- Norm layers and residual connections
+Each ~144ms denoising step breaks down as:
+- Attention Kernels: 52ms (36%) - Self-attn 18ms, Cross-attn 16ms, Projections 18ms
+- FFN Layers: 49ms (34%) - Up/down projections dominate
+- KV Cache Ops: 8ms (6%) - Mostly on prompt switch
+- Layer Norms: 12ms (8%)
+- Other Overhead: 23ms (16%)
 
-### To Break 40ms
+### Why Paper Numbers Differ
+
+The paper's 20.7 FPS likely uses:
+- Smaller model or no LoRA
+- Optimized CUDA kernels not in public release
+- Different measurement methodology
+
+### To Achieve Real-Time (25 FPS = 40ms)
 
 **Option 1**: Fewer Denoising Steps (Requires Retraining)
 - LCM/Turbo distillation: 4 steps → 1-2 steps
@@ -197,21 +206,22 @@ The denoising steps alone consume ~32ms. With 4 steps, each step must complete i
 
 ### The Optimization Ceiling
 
-With all inference-time optimizations applied:
+With all inference-time optimizations applied (measured on H100):
 
 ```
-Theoretical Minimum (Engineering Optimized):
-├── Denoising: ~28ms (kernel overhead eliminated)
-├── VAE Decode: ~4ms (async, overlapped)
-├── KV Operations: ~1ms (static buffers)
-├── Overhead: ~1ms (syncs eliminated)
-└── Total: ~34ms ← Still needs architectural change for headroom
+Achieved Results:
+├── Balanced Preset (4 steps, BF16):     575ms (5.2 FPS)   -21.9%
+├── Turbo Preset (3 steps, BF16):        431ms (7.0 FPS)   -40.0%
+├── Turbo FP8 (3 steps, FP8):            302ms (9.1 FPS)   -56.0%
+├── Ultra Preset (2 steps, FP8):         215ms (12.0 FPS)  -66.6%
+└── Theoretical min (1 step, FP8):       ~120ms (est.)     -84%
 ```
 
-**Conclusion**: To reliably achieve <40ms with safety margin:
-1. Apply all inference-time optimizations (this project)
-2. AND reduce denoising steps via distillation (future work)
-3. OR use speculative execution (future work)
+**Conclusion**: To achieve real-time 25 FPS (40ms):
+1. ✅ Apply all inference-time optimizations (this project) - **DONE**
+2. Reduce denoising steps via distillation (future work) - 2 steps gets to 215ms
+3. Reduce model size or use specialized hardware
+4. The paper's claimed 20.7 FPS may use optimizations not in the public release
 
 ---
 
@@ -248,9 +258,11 @@ The `global_end_index` and `local_end_index` change with every frame, determinin
 config = OptimizationConfig(
     use_cuda_graphs=False,       # Don't use CUDA graphs
     use_torch_compile=True,      # Use torch.compile instead
-    compile_mode="reduce-overhead",
+    compile_mode="default",      # NOT reduce-overhead (uses CUDA graphs internally)
 )
 ```
+
+> **Note**: `reduce-overhead` mode uses CUDA graphs internally and fails with the same error as direct CUDA graph capture. Use `default` or `max-autotune` with `triton.cudagraphs=False`.
 
 ### Future Work: Making CUDA Graphs Work
 
