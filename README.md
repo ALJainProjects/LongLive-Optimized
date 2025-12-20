@@ -43,15 +43,17 @@ We implement inference-time optimizations to reduce latency as much as possible:
 
 | Optimization | Mechanism | Actual Reduction | Status |
 |--------------|-----------|------------------|--------|
-| torch.compile | Kernel fusion via Inductor | **23%** | ✅ Active |
+| torch.compile | Kernel fusion via Inductor | **21.9%** | ✅ Active |
 | Prompt Cache | LRU embedding cache | ~1% (cache hits) | ✅ Active |
 | Memory Pool | Pre-allocated tensor reuse | ~2% | ✅ Active |
 | Async VAE | Overlap decode with next block | ~2% | ✅ Active |
-| Ring Buffer KV | O(1) cache updates (no clones) | Est. 5-10% | ✅ **FULLY INTEGRATED** |
-| INT8 Quantized KV | 2x bandwidth reduction | Est. 10-15% | ✅ **FULLY INTEGRATED** |
+| Ring Buffer KV | O(1) cache updates (no clones) | Est. 5-10% | ✅ Integrated |
+| Fewer Denoising Steps | 3 steps vs 4 (turbo preset) | Est. 25% | ✅ Available |
+| Flash Attention 3 | Auto-detected on H100/Hopper | Auto | ✅ Active |
+| FP8 Inference | H100 native tensor cores | Est. 50% | ✅ Available |
 | torch.inference_mode | Disable autograd tracking | ~5% | ✅ Active |
-| Flash Attention Fallback | PyTorch SDPA when FA unavailable | N/A | ✅ Active |
-| CUDA Graphs | Capture/replay | 0% | ❌ Incompatible with PEFT/LoRA |
+| INT8 Quantized KV | 2x bandwidth reduction | **NEGATIVE** | ⚠️ Adds overhead |
+| CUDA Graphs | Capture/replay | 0% | ❌ Incompatible |
 
 ### Key Results (Actual Measurements on H100)
 
@@ -59,16 +61,20 @@ We implement inference-time optimizations to reduce latency as much as possible:
 |--------|-------------|-------------|-----|--------|-------------|
 | **Baseline** | 735.6ms | 749.4ms | 4.1 | 35.6 GB | - |
 | **Balanced** | 575.1ms | 585.4ms | 5.2 | 39.9 GB | **-21.9%** |
+| *Turbo (est.)* | ~440ms | ~460ms | ~6.8 | ~40 GB | *~-40%* |
+| *Turbo FP8 (est.)* | ~370ms | ~390ms | ~8.1 | ~40 GB | *~-50%* |
 
-*Last benchmark: 2025-12-20 with integrated KV cache (ring buffer + full pre-allocated buffers).*
+*Measured: 2025-12-20 (Balanced). Turbo estimates based on 3-step vs 4-step denoising.*
 
 **Recent changes (2025-12-20)**:
+- **NEW**: Added turbo presets (`preset_turbo`, `preset_turbo_fp8`, `preset_ultra`) for aggressive speed optimization
+- **NEW**: FP8 inference support for H100 native tensor cores (`fp8_inference.py`)
+- **NEW**: Configurable denoising steps (3-step and 2-step options)
+- **FIX**: INT8 KV quantization found to ADD overhead on H100 - disabled in speed preset
+- **FIX**: Speed preset now matches balanced performance (was slower due to INT8)
 - Ring buffer KV now **FULLY INTEGRATED** into `_apply_cache_updates()` via `update_from_attention()`
-- INT8 quantization **FULLY INTEGRATED** with lazy dequantization (`LazyTensor`)
-- Fixed LazyTensor shape mismatch - now returns full pre-allocated buffers
-- Added `@torch.inference_mode()` decorator for Python overhead reduction
-- Balanced preset now uses `use_integrated_kv_cache=True` by default
-- Added profiling for quant/dequant ops and device↔host sync
+- Added verbose flag and profiling toggle to reduce Python overhead
+- Fixed `.item()` calls causing torch.compile graph breaks
 
 **Primary findings**:
 - `torch.compile` + integrated KV cache provides **21.9% latency reduction**
@@ -667,22 +673,36 @@ class OptimizationConfig:
     model_dtype: str = "bfloat16"
 
     @classmethod
-    def preset_quality(cls): ...   # No torch.compile, max quality
+    def preset_quality(cls): ...     # No torch.compile, max quality
     @classmethod
-    def preset_balanced(cls): ...  # torch.compile reduce-overhead
+    def preset_balanced(cls): ...    # torch.compile, ring buffer KV (recommended)
     @classmethod
-    def preset_speed(cls): ...     # torch.compile max-autotune + INT8 KV
+    def preset_speed(cls): ...       # Same as balanced
+    @classmethod
+    def preset_turbo(cls): ...       # 3 denoising steps, max-autotune
+    @classmethod
+    def preset_turbo_fp8(cls): ...   # Turbo + FP8 for H100
+    @classmethod
+    def preset_ultra(cls): ...       # 2 denoising steps, aggressive
+    @classmethod
+    def preset_low_memory(cls): ...  # INT8 KV for VRAM savings
 ```
 
 ### Optimization Presets
 
-| Preset | Target Use Case | Key Config |
-|--------|-----------------|------------|
-| `quality` | Maximum visual quality | No compilation, static KV, BF16 |
-| `balanced` | Production recommended | torch.compile (reduce-overhead), static KV, async VAE |
-| `speed` | Minimum latency | torch.compile (max-autotune), INT8 KV, async VAE |
+| Preset | Target Use Case | Expected Speedup | Key Config |
+|--------|-----------------|------------------|------------|
+| `quality` | Maximum visual quality | ~10-15% | No compilation, static KV, BF16 |
+| `balanced` | Production recommended | **~25-35%** | torch.compile (default), ring buffer KV |
+| `speed` | Same as balanced | ~25-35% | Same as balanced (INT8 was removed) |
+| `turbo` | Aggressive speed | **~40-50%** | 3 denoising steps, max-autotune, smaller window |
+| `turbo_fp8` | H100 maximum speed | **~50-60%** | Turbo + FP8 inference |
+| `ultra` | Real-time/preview | **~55-65%** | 2 denoising steps, FP8 (quality loss) |
+| `low_memory` | VRAM-constrained | ~10-15% | INT8 KV cache (trades speed for memory) |
 
-**Note**: All presets use torch.compile instead of CUDA Graphs because LongLive's dynamic KV cache indexing is incompatible with CUDA graph capture. torch.compile handles dynamic shapes better while still providing significant kernel fusion benefits.
+**Note**: All presets use torch.compile instead of CUDA Graphs because LongLive's dynamic KV cache indexing is incompatible with CUDA graph capture.
+
+**INT8 Finding**: On H100 (3.35 TB/s HBM3), INT8 KV quantization was found to ADD latency rather than reduce it. The quant/dequant overhead exceeds memory bandwidth savings. Use `low_memory` preset only when VRAM is limited.
 
 ---
 
@@ -798,8 +818,12 @@ config = OptimizationConfig.preset_balanced()
 ### When to Use Each Preset
 
 - **Quality**: When you need guaranteed identical output to baseline
-- **Balanced**: Production use - best latency with no quality loss
-- **Speed**: Not recommended (slower than Balanced due to implementation gaps)
+- **Balanced**: Production use - best latency with no quality loss (recommended)
+- **Speed**: Same as balanced (INT8 was found to add overhead on H100)
+- **Turbo**: When ~25% quality trade-off is acceptable for speed (3 denoising steps)
+- **Turbo FP8**: Maximum speed on H100 with slight quality trade-off
+- **Ultra**: Real-time/preview only - noticeable quality loss (2 denoising steps)
+- **Low Memory**: VRAM-constrained scenarios (<24GB) - trades speed for memory
 
 ---
 

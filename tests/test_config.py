@@ -52,12 +52,45 @@ class TestOptimizationConfig:
         """Test speed preset configuration."""
         config = OptimizationConfig.preset_speed()
 
-        # Speed preset uses torch.compile instead of CUDA graphs
-        # (torch.compile handles dynamic KV cache shapes better)
+        # Speed preset now matches balanced (INT8 was found to add overhead)
         assert config.use_cuda_graphs is False
         assert config.use_torch_compile is True
+        assert config.use_quantized_kv is False  # INT8 disabled
+        assert config.use_static_kv is True
+
+    def test_preset_turbo(self):
+        """Test turbo preset configuration."""
+        config = OptimizationConfig.preset_turbo()
+
+        assert config.use_torch_compile is True
+        assert config.compile_mode == "max-autotune"
+        assert config.denoising_steps == [1000, 500, 250]  # 3 steps
+        assert config.local_attn_size == 8  # Smaller window
+        assert config.verbose is False
+
+    def test_preset_turbo_fp8(self):
+        """Test turbo FP8 preset configuration."""
+        config = OptimizationConfig.preset_turbo_fp8()
+
+        assert config.model_dtype == "fp8"
+        assert config.compile_mode == "max-autotune"
+        assert config.denoising_steps == [1000, 500, 250]  # 3 steps
+
+    def test_preset_ultra(self):
+        """Test ultra preset configuration."""
+        config = OptimizationConfig.preset_ultra()
+
+        assert config.model_dtype == "fp8"
+        assert config.denoising_steps == [1000, 250]  # 2 steps
+        assert config.local_attn_size == 6  # Minimum window
+
+    def test_preset_low_memory(self):
+        """Test low memory preset configuration."""
+        config = OptimizationConfig.preset_low_memory()
+
         assert config.use_quantized_kv is True
-        assert config.kv_quantization in ["int8", "fp8"]
+        assert config.kv_quantization == "int8"
+        assert config.use_static_kv is False  # Quantized takes precedence
 
     def test_mutual_exclusion_kv_cache(self):
         """Test that static KV and quantized KV are mutually exclusive."""
