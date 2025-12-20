@@ -205,14 +205,26 @@ class OptimizedCausalInferencePipeline:
         # 7. torch.compile (mutually exclusive with CUDA graphs)
         if self.config.use_torch_compile:
             try:
+                # Enable suppress_errors to fall back to eager mode for unsupported ops
+                # This is critical for PEFT/LoRA compatibility - PEFT hooks are not
+                # supported by torch.compile and would otherwise cause runtime failures
+                import torch._dynamo
+                torch._dynamo.config.suppress_errors = True
+
+                # Check if model uses PEFT and warn user
+                has_peft = hasattr(self.generator.model, 'peft_config') or \
+                           hasattr(self.generator.model, '_peft_config')
+                if has_peft:
+                    print(f"  [!] PEFT/LoRA detected: torch.compile will use partial compilation")
+
                 compile_mode = self.config.compile_mode
                 self.generator.model = torch.compile(
                     self.generator.model,
                     mode=compile_mode,
-                    fullgraph=self.config.compile_fullgraph,
+                    fullgraph=False,  # Disable fullgraph for PEFT compatibility
                 )
                 self._compiled = True
-                print(f"  [+] torch.compile: mode={compile_mode}, fullgraph={self.config.compile_fullgraph}")
+                print(f"  [+] torch.compile: mode={compile_mode}, fullgraph=False (PEFT-safe)")
             except Exception as e:
                 warnings.warn(f"torch.compile failed: {e}. Falling back to eager mode.")
                 self._compiled = False
