@@ -158,15 +158,16 @@ class TestLongLiveMemoryPool:
         noise = pool.get_buffer('noise')
         pool.return_buffer('noise')
 
-        # [B, C, F, H, W]
-        assert noise.shape == (1, 16, 1, 60, 104)
+        # [B, C, F, H, W] - num_frames=12 from fixture
+        assert noise.shape == (1, 16, 12, 60, 104)
 
     def test_latents_shape(self, pool):
         """Test latents buffer has correct shape."""
         latents = pool.get_buffer('latents')
         pool.return_buffer('latents')
 
-        assert latents.shape == (1, 16, 1, 60, 104)
+        # [B, C, F, H, W] - num_frames=12 from fixture
+        assert latents.shape == (1, 16, 12, 60, 104)
 
     def test_memory_efficiency(self, pool):
         """Test memory is allocated upfront."""

@@ -263,11 +263,14 @@ class TestAsyncPromptCache:
         """Test prefetch skips already cached prompts."""
         prompt = "Test prompt"
 
-        # Cache it first
+        # Cache it first (this is a miss, not a hit)
         cache.get_embeddings([prompt])
+        assert cache.misses == 1
+        assert cache.hits == 0
 
         # Prefetch should do nothing (already cached)
         cache.prefetch_async([prompt])
 
-        # Should still have just one hit
-        assert cache.hits == 1
+        # Stats should not change since prefetch skipped
+        assert cache.misses == 1
+        assert cache.hits == 0
