@@ -218,34 +218,61 @@ class OptimizationConfig:
     @classmethod
     def preset_speed(cls) -> 'OptimizationConfig':
         """
-        Maximum speed preset with acceptable quality trade-offs.
+        Maximum speed preset - identical to balanced for optimal performance.
 
         Focus: Minimum latency
-        Expected: ~40-50% latency reduction
-        Quality impact: Slight (~1-2% from INT8 quantization)
+        Expected: ~25-35% latency reduction (same as balanced)
+        Quality impact: Negligible
 
-        Optimizations enabled:
-        - All balanced preset optimizations
-        - INT8 quantized KV cache (2x memory bandwidth reduction)
-        - torch.compile default mode (PEFT-compatible, stable performance)
-
-        Note: Uses "default" mode instead of "max-autotune" for stability
-        with PEFT/LoRA models.
+        Note: INT8 quantization was found to ADD overhead rather than reduce
+        latency on modern GPUs like H100 (3.35 TB/s HBM3). The quant/dequant
+        overhead exceeds any memory bandwidth savings. Use preset_low_memory()
+        if you need to reduce VRAM usage at the cost of some speed.
         """
         return cls(
             enabled=True,
             use_cuda_graphs=False,  # torch.compile is more robust
+            use_static_kv=True,  # Buffer reuse
+            use_quantized_kv=False,  # INT8 adds overhead on modern GPUs
+            use_integrated_kv_cache=True,  # Ring buffer with full pre-allocated buffers
+            use_async_vae=True,
+            use_prompt_cache=True,
+            use_memory_pool=True,
+            use_pinned_memory=True,
+            model_dtype="bfloat16",
+            use_torch_compile=True,
+            compile_mode="default",  # Use default for PEFT/LoRA compatibility
+        )
+
+    @classmethod
+    def preset_low_memory(cls) -> 'OptimizationConfig':
+        """
+        Low memory preset - trades some speed for reduced VRAM usage.
+
+        Focus: Minimize memory usage
+        Expected: ~10-15% latency reduction (slower than balanced/speed)
+        Memory savings: ~30-40% less KV cache memory (INT8 compression)
+        Quality impact: Slight (~1-2% from INT8 quantization)
+
+        Use this preset when:
+        - Running on GPUs with limited VRAM (< 24GB)
+        - Generating very long videos where KV cache grows large
+        - Running multiple concurrent generations
+        """
+        return cls(
+            enabled=True,
+            use_cuda_graphs=False,
             use_static_kv=False,  # Quantized KV takes precedence
-            use_quantized_kv=True,
-            use_integrated_kv_cache=True,  # Ring buffer + INT8 quantization
+            use_quantized_kv=True,  # INT8 for memory savings
+            use_integrated_kv_cache=True,  # Ring buffer + INT8
             kv_quantization="int8",
             use_async_vae=True,
             use_prompt_cache=True,
             use_memory_pool=True,
             use_pinned_memory=True,
-            model_dtype="bfloat16",  # Keep model in bfloat16, only KV is quantized
+            model_dtype="bfloat16",
             use_torch_compile=True,
-            compile_mode="default",  # Use default instead of max-autotune for PEFT/LoRA
+            compile_mode="default",
         )
 
     def get_torch_dtype(self) -> torch.dtype:
