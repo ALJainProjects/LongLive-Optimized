@@ -200,8 +200,9 @@ class OptimizationConfig:
         return cls(
             enabled=True,
             use_cuda_graphs=False,  # torch.compile is more robust with KV cache
-            use_static_kv=True,
+            use_static_kv=False,  # Integrated KV takes precedence
             use_quantized_kv=False,
+            use_integrated_kv_cache=True,  # Ring buffer - O(1) cache updates
             use_async_vae=True,
             use_prompt_cache=True,
             use_memory_pool=True,

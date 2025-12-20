@@ -43,6 +43,7 @@ from .cuda_graphs import CUDAGraphWrapper, GraphCaptureConfig
 from .sync_elimination import SyncFreeContext
 from .quantized_kv import QuantizedKVCache, quantize_int8, dequantize_int8
 from .kv_cache_wrapper import QuantizedKVCacheList, create_quantized_kv_cache
+from .integrated_kv_cache import create_integrated_kv_cache
 
 
 class OptimizedCausalInferencePipeline:
@@ -181,6 +182,18 @@ class OptimizedCausalInferencePipeline:
             self._quantized_kv_cache = None
             self._kv_quantization = None
             print(f"  [-] Quantized KV: disabled")
+
+        # 5b. Integrated KV Cache (ring buffer + optional INT8 - BEST option)
+        # This takes precedence over both static KV and quantized KV
+        if self.config.use_integrated_kv_cache:
+            self._use_integrated_kv = True
+            self._integrated_kv_quantize = self.config.use_quantized_kv
+            print(f"  [+] Integrated KV: ring buffer + {'INT8' if self._integrated_kv_quantize else 'fp16'}")
+            print(f"      (eliminates memory copies, O(1) cache updates)")
+        else:
+            self._use_integrated_kv = False
+            self._integrated_kv_quantize = False
+            print(f"  [-] Integrated KV: disabled")
 
         # 6. CUDA Graphs (experimental - limited support due to KV cache dynamics)
         # Note: CUDA graphs require static memory addresses, but LongLive's KV cache
@@ -489,6 +502,47 @@ class OptimizedCausalInferencePipeline:
 
             return kv_cache
 
+    def _initialize_kv_cache_integrated(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        kv_cache_size: int,
+    ) -> List:
+        """
+        Initialize KV cache with ring buffer and optional INT8 quantization.
+
+        This is the OPTIMAL implementation that:
+        - Uses ring buffer for O(1) cache updates (no memory copies)
+        - Optionally uses INT8 quantization for 2x bandwidth reduction
+        - Integrates with _apply_cache_updates via update_from_attention()
+
+        Returns a list of IntegratedKVCacheLayer objects that extend dict
+        for seamless compatibility with existing code.
+        """
+        with self.profiler.measure("kv_cache_init_integrated"):
+            # Get local attention config from model
+            local_attn_cfg = getattr(self.args.model_kwargs, "local_attn_size", 12)
+            if local_attn_cfg == -1:
+                local_attn_cfg = 12  # Default
+
+            kv_cache = create_integrated_kv_cache(
+                num_layers=self.num_transformer_blocks,
+                num_heads=12,  # LongLive default
+                head_dim=128,  # LongLive default
+                local_window_frames=local_attn_cfg,
+                sink_frames=3,  # Default sink frames
+                frame_seq_length=self.frame_seq_length,
+                batch_size=batch_size,
+                use_ring_buffer=True,  # O(1) updates
+                use_quantization=self._integrated_kv_quantize,  # INT8 if enabled
+                dtype=dtype,
+                device=str(device),
+            )
+
+            return kv_cache
+
+    @torch.inference_mode()
     def inference(
         self,
         noise: torch.Tensor,
@@ -505,6 +559,9 @@ class OptimizedCausalInferencePipeline:
         fine-grained control over profiling and async operations.
 
         The logic exactly mirrors CausalInferencePipeline.inference().
+
+        Note: @torch.inference_mode() disables autograd tracking for ~5-10%
+        Python overhead reduction in the hot path.
         """
         # Enable profiling if requested
         if profile:
@@ -573,8 +630,16 @@ class OptimizedCausalInferencePipeline:
             else:
                 kv_cache_size = num_output_frames * self.frame_seq_length
 
-            # Use optimized cache initialization (quantized or standard)
-            if self._use_quantized_kv:
+            # Use optimized cache initialization (integrated > quantized > standard)
+            # Integrated takes precedence: ring buffer + optional INT8
+            if self._use_integrated_kv:
+                self.base.kv_cache1 = self._initialize_kv_cache_integrated(
+                    batch_size=batch_size,
+                    dtype=noise.dtype,
+                    device=noise.device,
+                    kv_cache_size=kv_cache_size,
+                )
+            elif self._use_quantized_kv:
                 self.base.kv_cache1 = self._initialize_kv_cache_quantized(
                     batch_size=batch_size,
                     dtype=noise.dtype,
@@ -711,8 +776,12 @@ class OptimizedCausalInferencePipeline:
         print(f"\nActive Optimizations:")
         print(f"  Prompt Cache:   {'✓' if self.prompt_cache else '✗'}")
         print(f"  Memory Pool:    {'✓' if self.memory_pool else '✗'}")
-        print(f"  Static KV:      {'✓' if self._preallocated_kv else '✗'}")
-        print(f"  Quantized KV:   {'✓ ' + self._kv_quantization if self._use_quantized_kv else '✗'}")
+        print(f"  Static KV:      {'✓' if self._preallocated_kv and not self._use_integrated_kv else '✗'}")
+        print(f"  Quantized KV:   {'✓ ' + self._kv_quantization if self._use_quantized_kv and not self._use_integrated_kv else '✗'}")
+        integrated_status = '✓ ring buffer'
+        if self._use_integrated_kv and self._integrated_kv_quantize:
+            integrated_status += ' + INT8'
+        print(f"  Integrated KV:  {integrated_status if self._use_integrated_kv else '✗'}")
         print(f"  Async VAE:      {'✓' if self.async_vae else '✗'}")
         print(f"  CUDA Graphs:    {'✓' if self.cuda_graph else '✗'}" +
               (f" (captured={self._cuda_graph_captured})" if self.cuda_graph else ""))
