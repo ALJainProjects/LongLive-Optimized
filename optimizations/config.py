@@ -70,6 +70,9 @@ class OptimizationConfig:
     profile_cuda_events: bool = True  # Use CUDA events for timing
     profile_memory: bool = True  # Track memory usage
 
+    # === Logging ===
+    verbose: bool = True  # Print optimization setup info (disable for production)
+
     # === Generation Defaults ===
     num_frames: int = 120
     num_frame_per_block: int = 3

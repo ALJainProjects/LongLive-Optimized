@@ -22,6 +22,11 @@ from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log
 
 from utils.debug_option import DEBUG
 
+# OPTIMIZATION: Enable capturing scalar outputs to prevent graph breaks from .item() calls
+# This allows torch.compile to include scalar tensor operations in the compiled graph
+# instead of breaking and re-compiling whenever .item() is called
+torch._dynamo.config.capture_scalar_outputs = True
+
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
 # change to default for other models
@@ -86,6 +91,9 @@ class CausalWanSelfAttention(nn.Module):
         non_neg_vals = [int(v) for v in values if int(v) != -1]
         max_local = max(non_neg_vals) if len(non_neg_vals) > 0 else -1
         self.max_attention_size = 32760 if max_local == -1 else max_local * 1560
+        # OPTIMIZATION: Cache frame_seqlen to avoid repeated .item() calls in hot path
+        self._cached_frame_seqlen = None
+        self._cached_grid_hash = None
         # layers
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
@@ -203,7 +211,13 @@ class CausalWanSelfAttention(nn.Module):
                     block_mask=block_mask
                 )[:, :, :-padded_length].transpose(2, 1)
         else:
-            frame_seqlen = math.prod(grid_sizes[0][1:]).item()
+            # OPTIMIZATION: Cache frame_seqlen to avoid repeated .item() calls
+            # Grid sizes are constant for a given video resolution
+            grid_hash = (grid_sizes[0][1].item(), grid_sizes[0][2].item())  # (H, W)
+            if self._cached_frame_seqlen is None or self._cached_grid_hash != grid_hash:
+                self._cached_frame_seqlen = grid_hash[0] * grid_hash[1]
+                self._cached_grid_hash = grid_hash
+            frame_seqlen = self._cached_frame_seqlen
             current_start_frame = current_start // frame_seqlen
             roped_query = causal_rope_apply(
                 q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
@@ -215,25 +229,20 @@ class CausalWanSelfAttention(nn.Module):
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = kv_cache["k"].shape[1]
             num_new_tokens = roped_query.shape[1]
-            # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
-            #     print("***********before attention***********")
-            #     print(f"kv_cache_size = {kv_cache_size / frame_seqlen}")
-            #     print(f"torch.is_grad_enabled() = {torch.is_grad_enabled()}")
-            #     print(f"current_end = {current_end / frame_seqlen}")
-            #     print(f"current_start = {current_start / frame_seqlen}")
-            #     print(f"kv_cache['global_end_index'] = {kv_cache['global_end_index']}")
-            #     print(f"kv_cache['local_end_index'] = {kv_cache['local_end_index']}")
-            #     print(f"num_new_tokens = {num_new_tokens}")
+
+            # OPTIMIZATION: Batch .item() calls to single GPU sync instead of 7 separate syncs
+            global_end_idx = kv_cache["global_end_index"].item()
+            local_end_idx = kv_cache["local_end_index"].item()
 
             # Compute cache update parameters without modifying kv_cache directly
             cache_update_info = None
-            is_recompute = current_end <= kv_cache["global_end_index"].item() and current_start > 0
-            if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
-                    num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
+            is_recompute = current_end <= global_end_idx and current_start > 0
+            if self.local_attn_size != -1 and (current_end > global_end_idx) and (
+                    num_new_tokens + local_end_idx > kv_cache_size):
                 # Calculate the number of new tokens added in this step
                 # Shift existing cache content left to discard oldest tokens
-                num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-                num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
+                num_evicted_tokens = num_new_tokens + local_end_idx - kv_cache_size
+                num_rolled_tokens = local_end_idx - num_evicted_tokens - sink_tokens
                 # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
                 #     print(f"need roll")
                 #     print(f"num_rolled_tokens: {num_rolled_tokens / frame_seqlen}")
@@ -241,8 +250,7 @@ class CausalWanSelfAttention(nn.Module):
                 #     print(f"sink_tokens: {sink_tokens / frame_seqlen}")
 
                 # Compute updated local indices
-                local_end_index = kv_cache["local_end_index"].item() + current_end - \
-                    kv_cache["global_end_index"].item() - num_evicted_tokens
+                local_end_index = local_end_idx + current_end - global_end_idx - num_evicted_tokens
                 local_start_index = local_end_index - num_new_tokens
 
                 # Construct full k, v for attention computation (without modifying the original cache)
@@ -251,10 +259,11 @@ class CausalWanSelfAttention(nn.Module):
                 temp_v = kv_cache["v"].clone()
                 
                 # Apply rolling update to the temporary cache
-                temp_k[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    temp_k[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                temp_v[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    temp_v[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
+                # NOTE: No .clone() needed - slices of an already-cloned tensor
+                temp_k[:, sink_tokens:sink_tokens + num_rolled_tokens].copy_(
+                    temp_k[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens])
+                temp_v[:, sink_tokens:sink_tokens + num_rolled_tokens].copy_(
+                    temp_v[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens])
                 
                 # Insert new key/value into the temporary cache
                 # Protect sink_tokens only during recomputation; regular forward generation allows writing into the initial sink region
@@ -285,7 +294,7 @@ class CausalWanSelfAttention(nn.Module):
                 #     print(f"used kv cache size: local_end_index - local_start_index = {local_end_index - local_start_index}")
             else:
                 # Assign new keys/values directly up to current_end
-                local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
+                local_end_index = local_end_idx + current_end - global_end_idx
                 local_start_index = local_end_index - num_new_tokens
 
                 # Construct full k, v for attention computation (without modifying the original cache)

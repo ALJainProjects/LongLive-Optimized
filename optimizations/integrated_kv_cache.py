@@ -44,9 +44,15 @@ class LazyTensor:
     this and return the appropriate tensor without full copies.
     """
 
-    # Class-level profiling stats
+    # Class-level profiling stats and toggle
+    _profiling_enabled = False  # Set to True only when profiling is needed
     _total_dequant_time_ms = 0.0
     _total_dequant_count = 0
+
+    @classmethod
+    def enable_profiling(cls, enabled: bool = True):
+        """Enable or disable profiling (disabled by default for performance)."""
+        cls._profiling_enabled = enabled
 
     def __init__(
         self,
@@ -67,19 +73,18 @@ class LazyTensor:
             return self._materialized
 
         if self._is_quantized and self._scale is not None:
-            # Dequantize: INT8 * scale -> target_dtype with timing
-            if torch.cuda.is_available():
+            # Dequantize: INT8 * scale -> target_dtype
+            if LazyTensor._profiling_enabled and torch.cuda.is_available():
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
                 start.record()
-
-            self._materialized = (self._data.float() * self._scale).to(self._target_dtype)
-
-            if torch.cuda.is_available():
+                self._materialized = (self._data.float() * self._scale).to(self._target_dtype)
                 end.record()
                 torch.cuda.synchronize()
                 LazyTensor._total_dequant_time_ms += start.elapsed_time(end)
-                LazyTensor._total_dequant_count += 1
+            else:
+                self._materialized = (self._data.float() * self._scale).to(self._target_dtype)
+            LazyTensor._total_dequant_count += 1
         else:
             self._materialized = self._data
         return self._materialized
@@ -136,11 +141,10 @@ class IntegratedKVCacheLayer(dict):
         self.config = config
         self.device = torch.device(config.device)
 
-        # Profiling counters for quant/dequant
+        # Profiling counters for quant/dequant (only used when profiling enabled)
+        self._profiling_enabled = False
         self._quant_time_ms = 0.0
-        self._dequant_time_ms = 0.0
         self._quant_count = 0
-        self._dequant_count = 0
 
         # Calculate sizes
         self.sink_size = config.sink_frames * config.frame_seq_length
@@ -205,7 +209,7 @@ class IntegratedKVCacheLayer(dict):
 
     def _quantize_int8(self, tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize tensor to INT8 with per-token scaling."""
-        if torch.cuda.is_available():
+        if self._profiling_enabled and torch.cuda.is_available():
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
@@ -215,12 +219,12 @@ class IntegratedKVCacheLayer(dict):
         scale = scale.clamp(min=1e-8)
         quantized = (tensor / scale).round().clamp(-128, 127).to(torch.int8)
 
-        if torch.cuda.is_available():
+        if self._profiling_enabled and torch.cuda.is_available():
             end.record()
             torch.cuda.synchronize()
             self._quant_time_ms += start.elapsed_time(end)
-            self._quant_count += 1
 
+        self._quant_count += 1
         return quantized, scale.float()
 
     def update_cache(
@@ -508,6 +512,12 @@ class IntegratedKVCache(list):
         for layer in self:
             layer.reset_quant_stats()
         LazyTensor.reset_dequant_stats()
+
+    def enable_profiling(self, enabled: bool = True):
+        """Enable or disable profiling for all layers (disabled by default for performance)."""
+        LazyTensor.enable_profiling(enabled)
+        for layer in self:
+            layer._profiling_enabled = enabled
 
 
 def create_integrated_kv_cache(

@@ -113,11 +113,16 @@ class OptimizedCausalInferencePipeline:
         self._prompt_cache_misses = 0
         self._frames_generated = 0
 
+    def _log(self, msg: str):
+        """Print message if verbose mode is enabled."""
+        if self.config.verbose:
+            print(msg)
+
     def _setup_optimizations(self):
         """Initialize optimization components."""
-        print(f"\n{'='*60}")
-        print("Setting up LongLive optimizations")
-        print(f"{'='*60}")
+        self._log(f"\n{'='*60}")
+        self._log("Setting up LongLive optimizations")
+        self._log(f"{'='*60}")
 
         # 1. Prompt embedding cache
         if self.config.use_prompt_cache:
@@ -126,10 +131,10 @@ class OptimizedCausalInferencePipeline:
                 max_cache_size=self.config.prompt_cache_size,
                 device=self.device,
             )
-            print(f"  [+] Prompt cache: max {self.config.prompt_cache_size} prompts")
+            self._log(f"  [+] Prompt cache: max {self.config.prompt_cache_size} prompts")
         else:
             self.prompt_cache = None
-            print(f"  [-] Prompt cache: disabled")
+            self._log(f"  [-] Prompt cache: disabled")
 
         # 2. Memory pool for pre-allocation
         if self.config.use_memory_pool:
@@ -142,10 +147,10 @@ class OptimizedCausalInferencePipeline:
                 dtype=torch.bfloat16,
                 device=self.device,
             )
-            print(f"  [+] Memory pool: pre-allocated buffers")
+            self._log(f"  [+] Memory pool: pre-allocated buffers")
         else:
             self.memory_pool = None
-            print(f"  [-] Memory pool: disabled")
+            self._log(f"  [-] Memory pool: disabled")
 
         # 3. Async VAE decoder
         if self.config.use_async_vae:
@@ -153,10 +158,10 @@ class OptimizedCausalInferencePipeline:
                 vae=self.vae,
                 device=self.device,
             )
-            print(f"  [+] Async VAE: enabled")
+            self._log(f"  [+] Async VAE: enabled")
         else:
             self.async_vae = None
-            print(f"  [-] Async VAE: disabled")
+            self._log(f"  [-] Async VAE: disabled")
 
         # 4. Static KV cache pre-allocation
         if self.config.use_static_kv:
@@ -164,36 +169,36 @@ class OptimizedCausalInferencePipeline:
             # Pre-allocate KV cache buffers that persist across inference calls
             self._static_kv_buffers = None  # Will be allocated on first use
             self._static_crossattn_buffers = None
-            print(f"  [+] Static KV: pre-allocated buffers")
+            self._log(f"  [+] Static KV: pre-allocated buffers")
         else:
             self._preallocated_kv = False
             self._static_kv_buffers = None
             self._static_crossattn_buffers = None
-            print(f"  [-] Static KV: disabled")
+            self._log(f"  [-] Static KV: disabled")
 
         # 5. Quantized KV Cache (alternative to static KV)
         if self.config.use_quantized_kv:
             self._use_quantized_kv = True
             self._quantized_kv_cache = None  # Created on first use with proper dimensions
             self._kv_quantization = self.config.kv_quantization
-            print(f"  [+] Quantized KV: {self.config.kv_quantization} (10-15% bandwidth savings)")
+            self._log(f"  [+] Quantized KV: {self.config.kv_quantization} (10-15% bandwidth savings)")
         else:
             self._use_quantized_kv = False
             self._quantized_kv_cache = None
             self._kv_quantization = None
-            print(f"  [-] Quantized KV: disabled")
+            self._log(f"  [-] Quantized KV: disabled")
 
         # 5b. Integrated KV Cache (ring buffer + optional INT8 - BEST option)
         # This takes precedence over both static KV and quantized KV
         if self.config.use_integrated_kv_cache:
             self._use_integrated_kv = True
             self._integrated_kv_quantize = self.config.use_quantized_kv
-            print(f"  [+] Integrated KV: ring buffer + {'INT8' if self._integrated_kv_quantize else 'fp16'}")
-            print(f"      (eliminates memory copies, O(1) cache updates)")
+            self._log(f"  [+] Integrated KV: ring buffer + {'INT8' if self._integrated_kv_quantize else 'fp16'}")
+            self._log(f"      (eliminates memory copies, O(1) cache updates)")
         else:
             self._use_integrated_kv = False
             self._integrated_kv_quantize = False
-            print(f"  [-] Integrated KV: disabled")
+            self._log(f"  [-] Integrated KV: disabled")
 
         # 6. CUDA Graphs (experimental - limited support due to KV cache dynamics)
         # Note: CUDA graphs require static memory addresses, but LongLive's KV cache
@@ -209,12 +214,12 @@ class OptimizedCausalInferencePipeline:
                 device=self.device,
             )
             self._cuda_graph_captured = False
-            print(f"  [!] CUDA Graphs: enabled but LIMITED (KV cache dynamics)")
-            print(f"      Recommend: use_torch_compile=True instead")
+            self._log(f"  [!] CUDA Graphs: enabled but LIMITED (KV cache dynamics)")
+            self._log(f"      Recommend: use_torch_compile=True instead")
         else:
             self.cuda_graph = None
             self._cuda_graph_captured = False
-            print(f"  [-] CUDA Graphs: disabled")
+            self._log(f"  [-] CUDA Graphs: disabled")
 
         # 7. torch.compile (mutually exclusive with CUDA graphs)
         if self.config.use_torch_compile:
@@ -228,7 +233,7 @@ class OptimizedCausalInferencePipeline:
                 has_peft = hasattr(self.generator.model, 'peft_config') or \
                            hasattr(self.generator.model, '_peft_config')
                 if has_peft:
-                    print(f"  [!] PEFT/LoRA detected: torch.compile will use partial compilation")
+                    self._log(f"  [!] PEFT/LoRA detected: torch.compile will use partial compilation")
 
                 compile_mode = self.config.compile_mode
                 self.generator.model = torch.compile(
@@ -237,20 +242,20 @@ class OptimizedCausalInferencePipeline:
                     fullgraph=False,  # Disable fullgraph for PEFT compatibility
                 )
                 self._compiled = True
-                print(f"  [+] torch.compile: mode={compile_mode}, fullgraph=False (PEFT-safe)")
+                self._log(f"  [+] torch.compile: mode={compile_mode}, fullgraph=False (PEFT-safe)")
             except Exception as e:
                 warnings.warn(f"torch.compile failed: {e}. Falling back to eager mode.")
                 self._compiled = False
-                print(f"  [!] torch.compile: FAILED - {e}")
+                self._log(f"  [!] torch.compile: FAILED - {e}")
         else:
             self._compiled = False
-            print(f"  [-] torch.compile: disabled")
+            self._log(f"  [-] torch.compile: disabled")
 
         # 8. Sync elimination tracking
         self._use_sync_free = True  # Always enable sync-free context
-        print(f"  [+] Sync-free context: enabled")
+        self._log(f"  [+] Sync-free context: enabled")
 
-        print(f"{'='*60}\n")
+        self._log(f"{'='*60}\n")
 
     def _install_hooks(self):
         """Install optimization hooks into base pipeline."""
@@ -760,33 +765,33 @@ class OptimizedCausalInferencePipeline:
         return video
 
     def _print_optimization_stats(self):
-        """Print optimization statistics."""
-        print(f"\n{'='*60}")
-        print("Optimization Statistics")
-        print(f"{'='*60}")
-        print(f"Frames generated: {self._frames_generated}")
+        """Print optimization statistics (only when profiling/verbose enabled)."""
+        self._log(f"\n{'='*60}")
+        self._log("Optimization Statistics")
+        self._log(f"{'='*60}")
+        self._log(f"Frames generated: {self._frames_generated}")
 
         # Prompt cache stats
         if self.prompt_cache is not None:
             total = self._prompt_cache_hits + self._prompt_cache_misses
             hit_rate = self._prompt_cache_hits / total * 100 if total > 0 else 0
-            print(f"Prompt cache: {self._prompt_cache_hits}/{total} hits ({hit_rate:.1f}%)")
+            self._log(f"Prompt cache: {self._prompt_cache_hits}/{total} hits ({hit_rate:.1f}%)")
 
         # Active optimizations summary
-        print(f"\nActive Optimizations:")
-        print(f"  Prompt Cache:   {'✓' if self.prompt_cache else '✗'}")
-        print(f"  Memory Pool:    {'✓' if self.memory_pool else '✗'}")
-        print(f"  Static KV:      {'✓' if self._preallocated_kv and not self._use_integrated_kv else '✗'}")
-        print(f"  Quantized KV:   {'✓ ' + self._kv_quantization if self._use_quantized_kv and not self._use_integrated_kv else '✗'}")
+        self._log(f"\nActive Optimizations:")
+        self._log(f"  Prompt Cache:   {'✓' if self.prompt_cache else '✗'}")
+        self._log(f"  Memory Pool:    {'✓' if self.memory_pool else '✗'}")
+        self._log(f"  Static KV:      {'✓' if self._preallocated_kv and not self._use_integrated_kv else '✗'}")
+        self._log(f"  Quantized KV:   {'✓ ' + self._kv_quantization if self._use_quantized_kv and not self._use_integrated_kv else '✗'}")
         integrated_status = '✓ ring buffer'
         if self._use_integrated_kv and self._integrated_kv_quantize:
             integrated_status += ' + INT8'
-        print(f"  Integrated KV:  {integrated_status if self._use_integrated_kv else '✗'}")
-        print(f"  Async VAE:      {'✓' if self.async_vae else '✗'}")
-        print(f"  CUDA Graphs:    {'✓' if self.cuda_graph else '✗'}" +
+        self._log(f"  Integrated KV:  {integrated_status if self._use_integrated_kv else '✗'}")
+        self._log(f"  Async VAE:      {'✓' if self.async_vae else '✗'}")
+        self._log(f"  CUDA Graphs:    {'✓' if self.cuda_graph else '✗'}" +
               (f" (captured={self._cuda_graph_captured})" if self.cuda_graph else ""))
-        print(f"  torch.compile:  {'✓' if self._compiled else '✗'}")
-        print(f"  Sync-Free:      {'✓' if self._use_sync_free else '✗'}")
+        self._log(f"  torch.compile:  {'✓' if self._compiled else '✗'}")
+        self._log(f"  Sync-Free:      {'✓' if self._use_sync_free else '✗'}")
 
         # Print quant/dequant stats if using integrated KV with quantization
         if self._use_integrated_kv and self._integrated_kv_quantize:
@@ -794,13 +799,13 @@ class OptimizedCausalInferencePipeline:
                 from .integrated_kv_cache import IntegratedKVCache
                 if isinstance(self.base.kv_cache1, IntegratedKVCache):
                     stats = self.base.kv_cache1.get_all_quant_stats()
-                    print(f"\nQuant/Dequant Stats:")
-                    print(f"  Quantize:   {stats['total_quant_time_ms']:.2f}ms ({stats['total_quant_count']} ops, avg {stats['avg_quant_ms']:.3f}ms)")
-                    print(f"  Dequantize: {stats['total_dequant_time_ms']:.2f}ms ({stats['total_dequant_count']} ops, avg {stats['avg_dequant_ms']:.3f}ms)")
+                    self._log(f"\nQuant/Dequant Stats:")
+                    self._log(f"  Quantize:   {stats['total_quant_time_ms']:.2f}ms ({stats['total_quant_count']} ops, avg {stats['avg_quant_ms']:.3f}ms)")
+                    self._log(f"  Dequantize: {stats['total_dequant_time_ms']:.2f}ms ({stats['total_dequant_count']} ops, avg {stats['avg_dequant_ms']:.3f}ms)")
             except Exception:
                 pass
 
-        print(f"{'='*60}")
+        self._log(f"{'='*60}")
 
     def switch_prompt(self, new_prompts: List[str]) -> None:
         """
