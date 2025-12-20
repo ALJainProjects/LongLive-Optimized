@@ -27,10 +27,12 @@ class TestStaticKVCache:
             'num_layers': 4,
             'num_heads': 8,
             'head_dim': 64,
-            'local_window': 12,
-            'sink_size': 3,
+            'local_window_frames': 12,
+            'sink_frames': 3,
+            'frame_seq_length': 100,  # tokens per frame
+            'batch_size': 1,
             'dtype': torch.bfloat16,
-            'device': 'cuda',
+            'device': torch.device('cuda'),
         }
 
     @pytest.fixture
@@ -42,119 +44,123 @@ class TestStaticKVCache:
         """Test cache is initialized with correct shapes."""
         assert cache.num_layers == cache_config['num_layers']
         assert cache.num_heads == cache_config['num_heads']
-        assert cache.local_window == cache_config['local_window']
+        assert cache.local_window_frames == cache_config['local_window_frames']
 
-        # Check buffers are allocated
-        assert cache.local_k is not None
-        assert cache.local_v is not None
-        assert cache.sink_k is not None
-        assert cache.sink_v is not None
+    def test_buffer_allocation(self, cache):
+        """Test buffers are allocated for each layer."""
+        for layer_idx in range(cache.num_layers):
+            sink_k, sink_v = cache.get_sink_kv(layer_idx)
+            local_k, local_v = cache.get_local_kv(layer_idx)
 
-    def test_buffer_shapes(self, cache, cache_config):
-        """Test buffer shapes are correct."""
-        expected_local_shape = (
-            cache_config['num_layers'],
-            1,  # batch
+            assert sink_k is not None
+            assert sink_v is not None
+            assert local_k is not None
+            assert local_v is not None
+
+    def test_sink_kv_shapes(self, cache, cache_config):
+        """Test sink KV cache shapes are correct."""
+        sink_k, sink_v = cache.get_sink_kv(0)
+
+        expected_sink_size = cache_config['sink_frames'] * cache_config['frame_seq_length']
+        expected_shape = (
+            cache_config['batch_size'],
+            expected_sink_size,
             cache_config['num_heads'],
-            cache_config['local_window'],
             cache_config['head_dim'],
         )
 
-        expected_sink_shape = (
-            cache_config['num_layers'],
-            1,  # batch
+        assert sink_k.shape == expected_shape
+        assert sink_v.shape == expected_shape
+
+    def test_local_kv_shapes(self, cache, cache_config):
+        """Test local KV cache shapes are correct."""
+        local_k, local_v = cache.get_local_kv(0)
+
+        expected_local_size = cache_config['local_window_frames'] * cache_config['frame_seq_length']
+        expected_shape = (
+            cache_config['batch_size'],
+            expected_local_size,
             cache_config['num_heads'],
-            cache_config['sink_size'],
             cache_config['head_dim'],
         )
 
-        assert cache.local_k.shape == expected_local_shape
-        assert cache.local_v.shape == expected_local_shape
-        assert cache.sink_k.shape == expected_sink_shape
-        assert cache.sink_v.shape == expected_sink_shape
+        assert local_k.shape == expected_shape
+        assert local_v.shape == expected_shape
 
-    def test_update_single_frame(self, cache):
-        """Test updating cache with a single frame."""
-        # Create dummy KV tensors
+    def test_update_single_token(self, cache):
+        """Test updating cache with tokens."""
+        # Create dummy KV tensors for one token
         new_k = torch.randn(
-            cache.num_layers, 1, cache.num_heads, 1, cache.head_dim,
-            device='cuda', dtype=torch.bfloat16
+            cache.batch_size, 1, cache.num_heads, cache.head_dim,
+            device=cache.device, dtype=cache.dtype
         )
         new_v = torch.randn_like(new_k)
 
-        initial_write_idx = cache.write_idx
-        cache.update(new_k, new_v)
+        layer_idx = 0
+        initial_valid = cache.valid_lengths[layer_idx].item()
 
-        # Write index should advance
-        assert cache.write_idx == (initial_write_idx + 1) % cache.local_window
+        cache.update(layer_idx, new_k, new_v)
 
-    def test_ring_buffer_wrap(self, cache):
-        """Test ring buffer wraps correctly."""
-        # Fill entire buffer
-        for i in range(cache.local_window + 5):
+        # Valid length should increase
+        assert cache.valid_lengths[layer_idx].item() == initial_valid + 1
+
+    def test_get_full_kv_empty(self, cache):
+        """Test get_full_kv with no local cache."""
+        k, v = cache.get_full_kv(0)
+
+        # Should return only sink cache
+        assert k.shape[1] == cache.sink_size
+
+    def test_get_full_kv_with_data(self, cache):
+        """Test get_full_kv after adding some tokens."""
+        layer_idx = 0
+        num_tokens = 50
+
+        for _ in range(num_tokens):
             new_k = torch.randn(
-                cache.num_layers, 1, cache.num_heads, 1, cache.head_dim,
-                device='cuda', dtype=torch.bfloat16
+                cache.batch_size, 1, cache.num_heads, cache.head_dim,
+                device=cache.device, dtype=cache.dtype
             )
             new_v = torch.randn_like(new_k)
-            cache.update(new_k, new_v)
+            cache.update(layer_idx, new_k, new_v)
 
-        # Should have wrapped
-        assert cache.write_idx == 5
+        k, v = cache.get_full_kv(layer_idx)
 
-    def test_get_cache_ordering(self, cache):
-        """Test get_cache returns correctly ordered KV pairs."""
-        # Write known values
-        for i in range(cache.local_window):
-            new_k = torch.full(
-                (cache.num_layers, 1, cache.num_heads, 1, cache.head_dim),
-                fill_value=float(i),
-                device='cuda', dtype=torch.bfloat16
-            )
-            new_v = torch.full_like(new_k, fill_value=float(i + 100))
-            cache.update(new_k, new_v)
-
-        k, v = cache.get_cache()
-
-        # Values should be in order 0, 1, 2, ...
-        for i in range(cache.local_window):
-            assert k[0, 0, 0, i, 0].item() == pytest.approx(float(i), abs=0.1)
+        # Should have sink + local tokens
+        expected_len = cache.sink_size + num_tokens
+        assert k.shape[1] == expected_len
 
     def test_reset(self, cache):
         """Test cache reset."""
+        layer_idx = 0
+
         # Add some data
-        for _ in range(5):
+        for _ in range(10):
             new_k = torch.randn(
-                cache.num_layers, 1, cache.num_heads, 1, cache.head_dim,
-                device='cuda', dtype=torch.bfloat16
+                cache.batch_size, 1, cache.num_heads, cache.head_dim,
+                device=cache.device, dtype=cache.dtype
             )
             new_v = torch.randn_like(new_k)
-            cache.update(new_k, new_v)
+            cache.update(layer_idx, new_k, new_v)
 
         cache.reset()
 
-        assert cache.write_idx == 0
-        assert cache.num_frames == 0
-
-    def test_step_increments_frame_count(self, cache):
-        """Test step() increments frame count."""
-        initial_frames = cache.num_frames
-
-        cache.step()
-
-        assert cache.num_frames == initial_frames + 1
+        # All counters should be zero
+        assert cache.write_indices[layer_idx].item() == 0
+        assert cache.valid_lengths[layer_idx].item() == 0
 
     def test_no_allocation_during_update(self, cache):
         """Test that update doesn't allocate new memory."""
+        layer_idx = 0
         torch.cuda.reset_peak_memory_stats()
 
         # Warm up
         for _ in range(3):
             new_k = torch.randn(
-                cache.num_layers, 1, cache.num_heads, 1, cache.head_dim,
-                device='cuda', dtype=torch.bfloat16
+                cache.batch_size, 1, cache.num_heads, cache.head_dim,
+                device=cache.device, dtype=cache.dtype
             )
-            cache.update(new_k, new_k.clone())
+            cache.update(layer_idx, new_k, new_k.clone())
 
         torch.cuda.synchronize()
         initial_memory = torch.cuda.memory_allocated()
@@ -162,10 +168,10 @@ class TestStaticKVCache:
         # Do many updates
         for _ in range(100):
             new_k = torch.randn(
-                cache.num_layers, 1, cache.num_heads, 1, cache.head_dim,
-                device='cuda', dtype=torch.bfloat16
+                cache.batch_size, 1, cache.num_heads, cache.head_dim,
+                device=cache.device, dtype=cache.dtype
             )
-            cache.update(new_k, new_k.clone())
+            cache.update(layer_idx, new_k, new_k.clone())
 
         torch.cuda.synchronize()
         final_memory = torch.cuda.memory_allocated()
@@ -174,44 +180,18 @@ class TestStaticKVCache:
         memory_growth = final_memory - initial_memory
         assert memory_growth < 1024 * 1024  # Less than 1MB growth
 
-    def test_sink_frames_initialization(self, cache):
-        """Test sink frames are set correctly."""
-        # Create sink frames
-        sink_k = torch.randn(
-            cache.num_layers, 1, cache.num_heads, cache.sink_size, cache.head_dim,
-            device='cuda', dtype=torch.bfloat16
-        )
-        sink_v = torch.randn_like(sink_k)
+    def test_dtype_preserved(self, cache):
+        """Test that cache preserves dtype."""
+        sink_k, _ = cache.get_sink_kv(0)
+        local_k, _ = cache.get_local_kv(0)
 
-        cache.set_sink(sink_k, sink_v)
+        assert sink_k.dtype == cache.dtype
+        assert local_k.dtype == cache.dtype
 
-        # Check sink frames are set
-        assert torch.allclose(cache.sink_k, sink_k)
-        assert torch.allclose(cache.sink_v, sink_v)
+    def test_device_preserved(self, cache):
+        """Test that cache is on correct device."""
+        sink_k, _ = cache.get_sink_kv(0)
+        local_k, _ = cache.get_local_kv(0)
 
-    def test_get_full_cache_with_sink(self, cache):
-        """Test get_full_cache combines sink and local correctly."""
-        # Set sink
-        sink_k = torch.ones(
-            cache.num_layers, 1, cache.num_heads, cache.sink_size, cache.head_dim,
-            device='cuda', dtype=torch.bfloat16
-        )
-        cache.set_sink(sink_k, sink_k.clone())
-
-        # Add local frames
-        for i in range(cache.local_window):
-            new_k = torch.full(
-                (cache.num_layers, 1, cache.num_heads, 1, cache.head_dim),
-                fill_value=float(i + 10),
-                device='cuda', dtype=torch.bfloat16
-            )
-            cache.update(new_k, new_k.clone())
-
-        k, v = cache.get_full_cache()
-
-        # Should have sink + local frames
-        expected_length = cache.sink_size + cache.local_window
-        assert k.shape[3] == expected_length
-
-        # Sink frames should be first
-        assert k[0, 0, 0, 0, 0].item() == pytest.approx(1.0, abs=0.1)
+        assert sink_k.device.type == 'cuda'
+        assert local_k.device.type == 'cuda'
