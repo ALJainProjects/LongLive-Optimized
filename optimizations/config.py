@@ -189,7 +189,11 @@ class OptimizationConfig:
 
         Optimizations enabled:
         - All quality preset optimizations
-        - torch.compile with reduce-overhead mode (kernel fusion)
+        - torch.compile with default mode (kernel fusion, PEFT-compatible)
+
+        Note: Uses "default" mode instead of "reduce-overhead" because
+        reduce-overhead uses CUDA graphs internally which conflicts with
+        dynamic KV cache indexing in LongLive's attention mechanism.
         """
         return cls(
             enabled=True,
@@ -202,7 +206,7 @@ class OptimizationConfig:
             use_pinned_memory=True,
             model_dtype="bfloat16",
             use_torch_compile=True,  # Recommended: handles dynamic shapes well
-            compile_mode="reduce-overhead",
+            compile_mode="default",  # Use default instead of reduce-overhead for PEFT/LoRA
         )
 
     @classmethod
@@ -217,7 +221,10 @@ class OptimizationConfig:
         Optimizations enabled:
         - All balanced preset optimizations
         - INT8 quantized KV cache (2x memory bandwidth reduction)
-        - max-autotune compile mode (longer warmup, faster steady-state)
+        - torch.compile default mode (PEFT-compatible, stable performance)
+
+        Note: Uses "default" mode instead of "max-autotune" for stability
+        with PEFT/LoRA models.
         """
         return cls(
             enabled=True,
@@ -231,7 +238,7 @@ class OptimizationConfig:
             use_pinned_memory=True,
             model_dtype="bfloat16",  # Keep model in bfloat16, only KV is quantized
             use_torch_compile=True,
-            compile_mode="max-autotune",
+            compile_mode="default",  # Use default instead of max-autotune for PEFT/LoRA
         )
 
     def get_torch_dtype(self) -> torch.dtype:
